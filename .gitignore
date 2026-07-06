@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Env / secrets
+.env
+*.env
+!/.env.example
+
+# Logs
+logs/*.log
+logs/*.jsonl
+logs/*.out
+session_*.zip
+
+# Generated QA artifacts
+dogfood-output/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# OS
+.DS_Store
