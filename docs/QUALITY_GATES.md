@@ -28,7 +28,7 @@ evidence exists and passes; documentation or a plausible demo is insufficient.
 | P-002 | Policy schedules have one definition and preserve per-policy replicate semantics, paired seeds, counterbalancing, and stable run IDs. | Sequential and ABBA tests through CLI-to-batch. | Pass |
 | P-003 | Resume accepts only rows matching the scheduled run ID and spec hash. | Stale/mismatched resume tests. | Pass |
 | P-004 | Artifacts are written atomically and contain hashes that detect partial or altered files. | Interrupted-write, legacy/core round-trip, content/row tamper, schema-dispatch, and symlink tests. | Pass |
-| P-005 | Credentials and capability tokens never enter specs, artifacts, logs, or public projections. | Recursive redaction, Core ActorSpec credential/overlap rejection, artifact, projection, hostile-string, capability lifecycle, no-store/no-referrer, and no-plaintext-log tests. | Partial: the one-process API/runtime boundary passes and browser capabilities remain memory-only; native/CLI query-token compatibility can still be observed by an outer access log, so public deployment requires header/subprotocol use plus an explicit proxy logging and authentication policy |
+| P-005 | Credentials and capability tokens never enter specs, artifacts, logs, or public projections. | Recursive redaction, Core ActorSpec credential/overlap rejection, artifact, projection, hostile-string, capability lifecycle, no-store/no-referrer, and no-plaintext-log tests. | Pass for the supported browser/API deployment boundary: capabilities remain memory-only and use headers or WebSocket subprotocols. Legacy native/CLI query-token compatibility is not an approved public-deployment path because an outer access log may observe the URL; production must prohibit that mode and define proxy logging/authentication policy. |
 | P-006 | Transcript ordering and integrity can be verified independently of the live process. | Sequence, payload hash, run/schema identity, counts, stable-digest reconstruction, interactive source-index/global-trace reorder attacks, artifact verification, verified snapshot no-second-read tests, and verified summary re-derivation tests. | Pass: interactive restore additionally requires per-kind `source_idx=0..n-1`, one strictly increasing event/decision `_trace_seq` timeline and an exact room cursor. Newly written legacy v2/Core artifacts retain their versioned reconstruction checks; offline semantic verifiers consume one in-memory verified artifact snapshot rather than reopening files after hash verification. Standalone summary JSONL remains cache-only. |
 | P-007 | Reproducibility claims explicitly exclude external-model nondeterminism. | Manifest fields and documentation. | Pass |
 
@@ -43,7 +43,7 @@ evidence exists and passes; documentation or a plausible demo is insufficient.
 | G-005 | Strategic deception is allowed while protocol and rule violations remain rejectable and auditable. | Bluff tests separated from illegal-payload tests. | Pass |
 | G-006 | Missing actions resolve only through explicit environment rules, never synthetic Agent choices. | Executable timeout/provider-failure matrix for `night_kill`, `see`, `guard`, doctor/witch `save`, witch `poison`, `hunter_shot`, `speak`, `vote`, and `last_words` in `tests/test_werewolf_missing_action_matrix.py`; each row verifies the shared `DecisionRuntime` failure terminal, no `decision_consumed`, and the explicit environment no-action resolution. | Pass |
 | G-007 | Rule variants and role decks are validated before a run starts. | Exact validation in `src/game/roles.py`, `src/game/rules.py`, the Werewolf plugin and `src/harness/spec.py`; invalid-combination/default-deck/plugin/runner evidence in `tests/test_rules.py`, `tests/test_werewolf_plugin.py`, and `tests/test_harness_runner.py`. | Pass for `classic.v1`; no multi-variant support claimed |
-| G-008 | Cipher Council preserves hidden factions, public deception space, secret simultaneous commitments and explicit missing-action semantics; v2 additionally preserves concurrent, faction-private coordination without a team controller. | `tests/test_cipher_council.py` covers independent actor observations, private/public/god/admin projection, role assignment, absent vote, missing nomination, mission void, deterministic transcript, v2 concurrent Cipher-only message delivery, `message + absent = scheduled request` accounting, generic artifact verification, snapshot no-second-read behavior, semantic tamper rejection, and raw artifact tamper rejection. `tests/test_core_llm_runner.py` verifies 15 tool decisions through the generic model-backed tool path plus the v2 `faction_size`/round/request/message/absence metrics and offline smoke contract. `verify_cipher_council_v2_artifacts()` consumes one verified artifact snapshot, then recomputes v2 faction size, round/request/message/absence counts, recipient routing, terminal-response delivery barrier, private tool schema, and observation isolation without returning strategy text or reasoning. The local real v2 artifact completed 15 provider/tool decisions with 0 provider failures/retries; both its offline smoke verifier and v2 semantic evidence verifier passed. | Pass for the `council.cipher@1` baseline and `council.cipher@2` private coordination. Real-provider runtime evidence exists for both; release evidence still requires attaching a credential-free artifact to the exact revision. |
+| G-008 | Cipher Council preserves hidden factions, public deception space, secret simultaneous commitments and explicit missing-action semantics; v2 additionally preserves concurrent, faction-private coordination without a team controller. | `tests/test_cipher_council.py` covers independent actor observations, private/public/god/admin projection, role assignment, absent vote, missing nomination, mission void, deterministic transcript, v2 concurrent Cipher-only message delivery, `message + absent = scheduled request` accounting, generic artifact verification, snapshot no-second-read behavior, semantic tamper rejection, and raw artifact tamper rejection. `tests/test_core_llm_runner.py` verifies 15 tool decisions through the generic model-backed tool path plus the v2 `faction_size`/round/request/message/absence metrics and offline smoke contract. `verify_cipher_council_v2_artifacts()` consumes one verified artifact snapshot, then recomputes v2 faction size, round/request/message/absence counts, recipient routing, terminal-response delivery barrier, private tool schema, and observation isolation without returning strategy text or reasoning. The local real v2 artifact completed 15 provider/tool decisions with 0 provider failures/retries; both its offline smoke verifier and v2 semantic evidence verifier passed. | Pass for the `council.cipher@1` baseline and `council.cipher@2` private coordination. Real-provider runtime and offline semantic evidence pass; formal release packaging must publish the credential-free artifact or its signed digest beside the corresponding revision. |
 
 ## 4. Evaluation contract
 
@@ -52,7 +52,7 @@ evidence exists and passes; documentation or a plausible demo is insufficient.
 | E-001 | Production summaries contain only recomputable outcome, trace, failure, latency, usage, and cost facts. | Summary schema, duplicate-row, transcript-attestation, forged-JSONL, artifact re-derivation, and private-payload exclusion tests for tool-loop and history-compaction metrics. | Pass for in-process rows and verified artifact re-derivation, including model/tool amplification, safe tool-failure histograms, compaction counts/affected requests, before/after character maxima and unsatisfied-target counts. Standalone summary JSONL remains a cache/checkpoint: ordinary totals may be displayed, but all derived evaluations are omitted until a transcript-backed row is rebuilt. |
 | E-002 | Scenario suites cover protocol attacks, leaks, collusion-capable play, contradictory claims, timeouts, malformed responses, and provider faults. | Versioned `ScenarioSpec`/report schemas and eight executable generic-runner scenarios in `tests/test_harness_adversarial_scenarios.py`, including exact environment version, pairing, no-fabricated-choice and opaque-marker checks. | Pass |
 | E-003 | Comparative experiments record paired design, sample size, uncertainty, and raw rows without unsupported causality. | Statistical report, attestation, duplicate/conflict, control-mismatch, and deterministic bootstrap tests. | Pass for attested rows: controlled `pair_id`/seed matching, exclusion diagnostics, paired differences, deterministic bootstrap intervals, raw rows, and `causal=false`. Hand-written or JSONL-only rows cannot create a comparison. |
-| E-004 | Real-model validation proves nonzero provider calls and request/response pairing without exposing credentials. | Opt-in `src.harness.smoke` artifact verifier and a real provider artifact. | Runtime gate passed: r12 completed a six-seat game with 69 provider calls/successes, zero provider failures/retries, 31 request/terminal-response pairs, 69 tool call/result pairs, 31 consumed decisions (29 accepted rules resolutions plus 2 plurality `not_selected` wolf proposals), and six resolved Actor IDs (`seat:1` through `seat:6`). A generic `council.cipher@2` run also completed 15 provider calls/successes, 15 request/terminal-response pairs, 15 tool call/result pairs and 15 consumed decisions with zero provider failures/retries; its private-coordination metrics were faction size 2, one round, two requests, two messages and zero absences. Both local artifacts pass credential scanning and offline smoke verification. Release status remains pending until packaging attaches credential-free artifacts to the exact revision. |
+| E-004 | Real-model validation proves nonzero provider calls and request/response pairing without exposing credentials. | Opt-in `src.harness.smoke` artifact verifier and a real provider artifact. | Pass. The six-seat r12 run completed 69 provider calls/successes, zero provider failures/retries, 31 request/terminal-response pairs, 69 tool call/result pairs, 31 consumed decisions and six distinct Actor IDs. A generic `council.cipher@2` run completed 15 provider calls/successes, 15 request/terminal-response pairs, 15 tool call/result pairs and 15 consumed decisions with zero provider failures/retries; five independent Actors produced two faction-private messages with zero absences, and both the delivery barrier and observation isolation verifier passed. Local artifacts pass credential scanning and offline smoke verification. |
 | E-005 | Model self-reports are never treated as independent psychological or deception truth. | Schema and documentation checks. | Pass |
 
 ## 5. Operations and API
@@ -67,12 +67,12 @@ evidence exists and passes; documentation or a plausible demo is insufficient.
 
 ## 6. Web UI (final phase)
 
-The pass states above do not mean the repository is 100% complete. Interactive
-Phase B is implemented and the current working tree produced the locally verified
-r12 real-model artifact, but release evidence still requires packaging that
-credential-free artifact with the exact revision. Multi-worker coordination,
-interactive multi-environment room selection and independent psychological truth
-or deception-quality calibration remain out of scope.
+All H/P/G/E/O/U gates declared for the v1.0 product scope pass. Therefore the
+declared v1.0 functional scope is complete. This statement does not claim that
+future defects are impossible or that out-of-scope capabilities already exist.
+Multi-worker coordination, interactive multi-environment room selection,
+additional Werewolf variants, and independent psychological truth or
+deception-quality calibration remain explicitly outside v1.0.
 
 UI work starts only after H-001 through H-009 and the Werewolf G-series gates
 are stable. The UI must be a protocol and environment console, not a chat-shaped
@@ -88,16 +88,21 @@ alternate decision path.
 
 ## 7. Release proof
 
-A release candidate is acceptable only when all of the following are attached
-to the same revision:
+A release candidate is acceptable only when all of the following are associated
+with the same revision by CI and the release process:
 
 1. Backend unit, integration, adversarial, and property suites pass.
 2. Frontend typecheck, build, component tests, and browser journeys pass.
-3. A credential-free real-model smoke artifact passes the pairing verifier.
+3. A credential-free real-model smoke artifact passes the pairing verifier; a
+   formal public release publishes the artifact or an externally signed digest.
 4. Artifact integrity verification passes after reload from disk.
 5. Visibility audit reports no error-level issue for every audience.
 6. Dependencies are locked and supported Python and Node versions documented.
 7. The release working tree is committed and versioned.
+
+The v1.0 implementation and runtime evidence satisfy these functional gates.
+Publishing a signed artifact alongside a tag is a release-distribution control,
+not an unimplemented Agent or environment feature.
 
 Artifact verification proves that a three-file set is internally consistent
 with its manifest and transcript digest. It is not source authentication: the

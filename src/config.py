@@ -159,11 +159,19 @@ def _positive_int_alias(keys: tuple[str, ...], default: str) -> int:
 HOST: str = _get("WEREWOLF_HOST", "127.0.0.1")
 PORT: int = int(_get("WEREWOLF_PORT", "8000"))
 LOG_LEVEL: str = _get("WEREWOLF_LOG_LEVEL", "info")
-CORS_ORIGINS: tuple[str, ...] = parse_cors_origins(
-    _get(
-        "WEREWOLF_CORS_ORIGINS",
-        "http://127.0.0.1:5173,http://localhost:5173",
+# The production FastAPI build is served on the API port itself. Include that
+# same-origin browser surface by default while retaining the Vite dev origins;
+# public deployments should still set an explicit exact-origin allowlist.
+_DEFAULT_LOCAL_CORS_ORIGINS = ",".join(
+    (
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        f"http://127.0.0.1:{PORT}",
+        f"http://localhost:{PORT}",
     )
+)
+CORS_ORIGINS: tuple[str, ...] = parse_cors_origins(
+    _get("WEREWOLF_CORS_ORIGINS", _DEFAULT_LOCAL_CORS_ORIGINS)
 )
 CORS_ALLOW_CREDENTIALS: bool = _strict_bool("WEREWOLF_CORS_ALLOW_CREDENTIALS", "false")
 if CORS_ALLOW_CREDENTIALS and "*" in CORS_ORIGINS:

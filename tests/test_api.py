@@ -14,7 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 
 import src.api.server as server_module
 from src.api.server import create_app
-from src.config import parse_cors_origins
+from src.config import PORT, CORS_ORIGINS, parse_cors_origins
 from src.game.models import Phase
 
 TEST_MODEL_CONFIG = {
@@ -110,6 +110,12 @@ def test_cors_preflight_allows_exact_local_origin_only(client):
     assert "access-control-allow-credentials" not in allowed.headers
     assert denied.status_code == 400
     assert "access-control-allow-origin" not in denied.headers
+
+
+def test_default_origins_cover_the_production_same_origin_api_port():
+    """The documented FastAPI production entry must accept its own browser WS Origin."""
+    assert f"http://127.0.0.1:{PORT}" in CORS_ORIGINS
+    assert f"http://localhost:{PORT}" in CORS_ORIGINS
 
 
 @pytest.mark.parametrize(
