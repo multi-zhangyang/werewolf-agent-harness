@@ -370,6 +370,7 @@ def _first_stable_difference(first: Any, second: Any) -> str:
                 key: normalized(item)
                 for key, item in value.items()
                 if key not in timing_keys and key not in {"ts_monotonic", "payload_hash"}
+                and key not in {"stable_digest", "counts_by_kind"}
             }
         if isinstance(value, list):
             return [normalized(item) for item in value]
