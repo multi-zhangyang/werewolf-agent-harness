@@ -101,7 +101,6 @@ jobs:
       - name: Run real REST, WebSocket, and browser journeys
         env:
           NO_PROXY: 127.0.0.1,localhost
-          no_proxy: 127.0.0.1,localhost
           PYTHONPATH: .
           WEREWOLF_RUN_BROWSER_E2E: "1"
         run: >-
