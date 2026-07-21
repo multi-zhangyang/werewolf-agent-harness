@@ -355,7 +355,50 @@ async def test_same_local_seeds_produce_stable_request_ids_and_transcript(monkey
 
     assert request_ids(first) == request_ids(second)
     assert request_ids(first)[0] == "stable-local-run:request:000001"
-    assert first.transcript_digest == second.transcript_digest
+    assert first.transcript_digest == second.transcript_digest, _first_stable_difference(
+        first.transcript,
+        second.transcript,
+    )
+
+
+def _first_stable_difference(first: Any, second: Any) -> str:
+    timing_keys = {"_ts", "deadline_monotonic", "latency_seconds", "elapsed_seconds"}
+
+    def normalized(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: normalized(item)
+                for key, item in value.items()
+                if key not in timing_keys and key not in {"ts_monotonic", "payload_hash"}
+            }
+        if isinstance(value, list):
+            return [normalized(item) for item in value]
+        return value
+
+    def visit(left: Any, right: Any, path: str = "$ first") -> str | None:
+        if type(left) is not type(right):
+            return f"{path}: type {type(left).__name__} != {type(right).__name__}"
+        if isinstance(left, dict):
+            if left.keys() != right.keys():
+                return f"{path}: keys {sorted(left)} != {sorted(right)}"
+            for key in left:
+                difference = visit(left[key], right[key], f"{path}.{key}")
+                if difference is not None:
+                    return difference
+            return None
+        if isinstance(left, list):
+            if len(left) != len(right):
+                return f"{path}: length {len(left)} != {len(right)}"
+            for index, (left_item, right_item) in enumerate(zip(left, right, strict=True)):
+                difference = visit(left_item, right_item, f"{path}[{index}]")
+                if difference is not None:
+                    return difference
+            return None
+        if left != right:
+            return f"{path}: {left!r} != {right!r}"
+        return None
+
+    return visit(normalized(first), normalized(second)) or "no normalized field difference"
 
 
 @pytest.mark.asyncio
