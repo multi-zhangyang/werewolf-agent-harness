@@ -75,6 +75,12 @@ class DecisionRuntime:
                 raise ValueError("expected_run_id must not be empty")
             self._expected_run_id = normalized_run_id
         self._accepted_request_ids: set[str] = set()
+        # Concurrent calls are accepted deterministically, but their agents may
+        # finish in any order. Commit terminal rows in acceptance order so an
+        # equivalent run produces the same append-only evidence transcript.
+        self._request_trace_sequence: dict[str, int] = {}
+        self._terminal_trace_buffer: dict[int, dict[str, Any]] = {}
+        self._next_terminal_trace_sequence = 1
         self._unresolved_tasks: dict[asyncio.Future[Any], str] = {}
 
     async def execute(self, actor: Any, request: Any) -> Any:
@@ -91,6 +97,9 @@ class DecisionRuntime:
         # There is no await between the check and insertion, so concurrent
         # decisions on one event loop cannot accept the same request ID twice.
         self._accepted_request_ids.add(trusted_request.request_id)
+        self._request_trace_sequence[trusted_request.request_id] = len(
+            self._accepted_request_ids
+        )
         self._emit_trace({
             "kind": "agent_request",
             "request": trusted_request.model_dump(),
@@ -173,7 +182,7 @@ class DecisionRuntime:
             ),
         }
         _attach_actor_trace_identity(response_trace, actor, trusted_request)
-        self._emit_trace(response_trace)
+        self._emit_terminal_trace(response_trace)
         if not validation.valid:
             raise _rejected_envelope_error(trusted_request, validation)
         return trusted_envelope
@@ -502,7 +511,7 @@ class DecisionRuntime:
         if legacy_phase is not None:
             failure_trace["phase"] = str(legacy_phase)
         _attach_actor_trace_identity(failure_trace, actor, request)
-        self._emit_trace(failure_trace)
+        self._emit_terminal_trace(failure_trace)
 
     def _trace_cancelled(
         self,
@@ -534,7 +543,7 @@ class DecisionRuntime:
         if legacy_phase is not None:
             trace["phase"] = str(legacy_phase)
         _attach_actor_trace_identity(trace, actor, request)
-        self._emit_trace(trace)
+        self._emit_terminal_trace(trace)
 
     def _trace_validation_failure(
         self,
@@ -564,7 +573,7 @@ class DecisionRuntime:
         if legacy_phase is not None:
             trace["phase"] = str(legacy_phase)
         _attach_actor_trace_identity(trace, actor, request)
-        self._emit_trace(trace)
+        self._emit_terminal_trace(trace)
 
     def add_trace_listener(self, listener: TraceCallback) -> None:
         if listener is self._on_trace or listener in self._trace_listeners:
@@ -575,6 +584,22 @@ class DecisionRuntime:
         self._on_trace(payload)
         for listener in tuple(self._trace_listeners):
             listener(payload)
+
+    def _emit_terminal_trace(self, payload: dict[str, Any]) -> None:
+        """Commit concurrent terminal rows in deterministic acceptance order."""
+        request_id = str(payload.get("request_id") or "")
+        sequence = self._request_trace_sequence.get(request_id)
+        if sequence is None:
+            raise RuntimeError("terminal trace does not belong to an accepted request")
+        if sequence in self._terminal_trace_buffer:
+            raise RuntimeError("request produced more than one terminal trace")
+        self._terminal_trace_buffer[sequence] = payload
+        while self._next_terminal_trace_sequence in self._terminal_trace_buffer:
+            terminal = self._terminal_trace_buffer.pop(
+                self._next_terminal_trace_sequence
+            )
+            self._next_terminal_trace_sequence += 1
+            self._emit_trace(terminal)
 
 
 def _rejected_envelope_error(

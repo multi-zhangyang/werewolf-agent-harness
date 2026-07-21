@@ -72,6 +72,39 @@ async def test_runtime_records_one_request_and_one_valid_envelope_terminal():
 
 
 @pytest.mark.asyncio
+async def test_runtime_commits_concurrent_terminals_in_request_acceptance_order():
+    release_first = asyncio.Event()
+
+    class OrderedCompletionAgent(_ValidAgent):
+        async def decide(self, request: ActionRequest) -> DecisionEnvelope:
+            if request.request_id == "request-1":
+                await release_first.wait()
+            else:
+                release_first.set()
+            return await super().decide(request)
+
+    trace: list[dict[str, Any]] = []
+    runtime = DecisionRuntime(on_trace=trace.append)
+    await asyncio.gather(
+        runtime.execute(OrderedCompletionAgent(), _request(request_id="request-1")),
+        runtime.execute(OrderedCompletionAgent(), _request(request_id="request-2")),
+    )
+
+    requests = [
+        row["request"]["request_id"]
+        for row in trace
+        if row["kind"] == "agent_request"
+    ]
+    terminals = [
+        row["request_id"]
+        for row in trace
+        if row["kind"].startswith("agent_response")
+    ]
+    assert requests == ["request-1", "request-2"]
+    assert terminals == requests
+
+
+@pytest.mark.asyncio
 async def test_runtime_rejects_wrong_agent_object_before_generic_decision():
     class WrongAgent:
         actor_id = "wrong"
