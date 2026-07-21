@@ -1,11 +1,20 @@
 """WebSocket 实时事件广播测试 —— 验证后端能持续向客户端推送事件。"""
 from __future__ import annotations
 
+import json
+
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
+from src.agent.information import build_observation
 from src.api.room_manager import RoomManager
 from src.api.server import create_app
+TEST_MODEL_CONFIG = {
+    "provider": "openai",
+    "model": "unit-test-model",
+    "api_base": "https://example.invalid/v1",
+    "api_key": "unit-test-key",
+}
 
 
 @pytest.fixture
@@ -37,10 +46,29 @@ def _create_room(client, *, human_seats: list[int] | None = None):
     res = client.post("/api/rooms", json={
         "player_names": ["A", "B", "C", "D", "E", "F"],
         "human_seats": human_seats or [],
+        "model_config": TEST_MODEL_CONFIG,
     })
     assert res.status_code == 200
     body = res.json()
     return body["room_id"], body["admin_token"], body.get("seat_tokens", {})
+
+
+def test_websocket_origin_must_match_exact_browser_allowlist(client):
+    room_id, _, _ = _create_room(client)
+
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(
+            f"/ws/{room_id}?mode=spectate",
+            headers={"Origin": "https://attacker.invalid"},
+        ):
+            pass
+    assert denied.value.code == 4403
+
+    with client.websocket_connect(
+        f"/ws/{room_id}?mode=spectate",
+        headers={"Origin": "http://localhost:5173"},
+    ) as websocket:
+        assert websocket.receive_json()["type"] == "snapshot"
 
 
 @pytest.mark.asyncio
@@ -68,6 +96,40 @@ async def test_websocket_receives_events_after_snapshot(client, manager):
         received = ws.receive_json()
         assert received["type"] == "phase_started"
         assert received["phase"] == "day"
+
+
+@pytest.mark.asyncio
+async def test_websocket_reconnect_since_delivers_only_missing_event(client, manager):
+    room_id, _, _ = _create_room(client)
+    room = manager.get_room(room_id)
+    assert room is not None
+    for day in (1, 2):
+        await manager._broadcast(
+            room,
+            {"type": "phase_started", "phase": "day", "day": day},
+            initial_replay=True,
+        )
+
+    with client.websocket_connect(f"/ws/{room_id}?mode=spectate") as first_ws:
+        first_snapshot = first_ws.receive_json()
+        first = first_ws.receive_json()
+        second = first_ws.receive_json()
+        assert first_snapshot["cursor"] == 2
+        assert [first["delivery_seq"], second["delivery_seq"]] == [1, 2]
+
+    await manager._broadcast(
+        room,
+        {"type": "phase_started", "phase": "day", "day": 3},
+        initial_replay=True,
+    )
+    with client.websocket_connect(f"/ws/{room_id}?mode=spectate&since=2") as resumed_ws:
+        resumed_snapshot = resumed_ws.receive_json()
+        missing = resumed_ws.receive_json()
+        assert resumed_snapshot["stream_id"] == first_snapshot["stream_id"]
+        assert resumed_snapshot["resumed_from"] == 2
+        assert resumed_snapshot["cursor"] == 3
+        assert missing["delivery_seq"] == 3
+        assert missing["day"] == 3
 
 
 @pytest.mark.asyncio
@@ -140,6 +202,23 @@ def test_websocket_replay_rejected_before_game_ended(client):
     assert exc.value.code == 4409
 
 
+def test_websocket_replay_accepts_incomplete_terminal_room(client, manager):
+    room_id, admin_token, _ = _create_room(client)
+    room = manager.get_room(room_id)
+    assert room is not None
+    room.status = "incomplete"
+    room.end_reason = "no_progress"
+
+    with client.websocket_connect(
+        f"/ws/{room_id}?mode=replay&token={admin_token}"
+    ) as websocket:
+        snapshot = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["status"] == "incomplete"
+    assert snapshot["view"]["god"] is True
+
+
 def test_websocket_god_requires_admin_token(client):
     room_id, admin_token, _ = _create_room(client)
     client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
@@ -148,6 +227,31 @@ def test_websocket_god_requires_admin_token(client):
         with client.websocket_connect(f"/ws/{room_id}?mode=god"):
             pass
     assert exc.value.code == 4403
+
+
+def test_public_and_player_snapshots_hide_persona_strategic_priors(client):
+    room_id, admin_token, seat_tokens = _create_room(client, human_seats=[1])
+    client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
+    room = client.app.state.room_manager.get_room(room_id)
+    assert room is not None
+    for actor in room.actors.values():
+        actor.persona_name = f"private-persona-{actor.seat}"
+
+    with client.websocket_connect(f"/ws/{room_id}?mode=spectate") as spectator:
+        public = spectator.receive_json()
+        assert "personas" not in public["view"]
+        assert all("persona" not in player for player in public["view"].get("players", []))
+
+    with client.websocket_connect(
+        f"/ws/{room_id}?mode=play&seat=1&token={seat_tokens['1']}"
+    ) as player:
+        private = player.receive_json()
+        assert "personas" not in private["view"]
+        assert all("persona" not in player for player in private["view"].get("players", []))
+
+    with client.websocket_connect(f"/ws/{room_id}?mode=god&token={admin_token}") as god:
+        full = god.receive_json()["view"]["players_full"]
+        assert any(item.get("persona") == "private-persona-1" for item in full)
 
 
 def test_websocket_play_requires_matching_seat_token(client):
@@ -178,6 +282,49 @@ def test_websocket_spectate_rejects_seat_parameter(client):
         with client.websocket_connect(f"/ws/{room_id}?mode=spectate&seat=1"):
             pass
     assert exc.value.code == 4400
+
+
+@pytest.mark.parametrize("cursor", ["-1", "+1", "1.5", "abc", ""])
+def test_websocket_rejects_malformed_delivery_cursor(client, cursor):
+    room_id, _, _ = _create_room(client)
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(f"/ws/{room_id}?mode=spectate&since={cursor}"):
+            pass
+    assert exc.value.code == 4400
+
+
+def test_websocket_rejects_future_delivery_cursor(client):
+    room_id, _, _ = _create_room(client)
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(f"/ws/{room_id}?mode=spectate&since=1") as ws:
+            ws.receive_json()
+    assert exc.value.code == 4400
+
+
+def test_websocket_reports_explicit_retained_history_gap():
+    import asyncio
+    from fastapi.testclient import TestClient
+
+    isolated_manager = RoomManager(ws_delivery_history_size=2)
+    with TestClient(create_app(manager=isolated_manager)) as isolated_client:
+        room_id, _, _ = _create_room(isolated_client)
+        room = isolated_manager.get_room(room_id)
+        assert room is not None
+        for day in range(1, 5):
+            asyncio.run(isolated_manager._broadcast(
+                room,
+                {"type": "phase_started", "phase": "day", "day": day},
+                initial_replay=True,
+            ))
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with isolated_client.websocket_connect(
+                f"/ws/{room_id}?mode=spectate&since=1"
+            ) as ws:
+                ws.receive_json()
+        assert exc.value.code == 4409
 
 
 def test_websocket_snapshot_hides_hidden_role_state_except_god(client, manager):
@@ -256,6 +403,142 @@ async def test_private_marker_overrides_public_allowlist(client, manager):
 
 
 @pytest.mark.asyncio
+async def test_play_public_event_strips_hidden_fields_like_spectate(client, manager):
+    """公开事件即使发给 play 客户端,也不能保留隐藏身份/推理字段。"""
+    room_id, admin_token, seat_tokens = _create_room(client, human_seats=[1])
+    client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
+
+    room = manager.get_room(room_id)
+    assert room is not None and room.orchestrator is not None
+
+    with (
+        client.websocket_connect(f"/ws/{room_id}?mode=spectate") as spectate_ws,
+        client.websocket_connect(f"/ws/{room_id}?mode=play&seat=1&token={seat_tokens['1']}") as play_ws,
+    ):
+        spectate_ws.receive_json()
+        play_ws.receive_json()
+
+        event = {
+            "type": "speech",
+            "phase": "day",
+            "day": 1,
+            "seat": 3,
+            "name": "C",
+            "text": "hello",
+            "role": "werewolf",
+            "team": "werewolves",
+            "reasoning": "hidden",
+            "thought": "secret",
+            "teammates": [5],
+        }
+        await room.orchestrator.on_event(event)
+
+        spectate_msg = spectate_ws.receive_json()
+        play_msg = play_ws.receive_json()
+
+        for msg in (spectate_msg, play_msg):
+            assert msg["type"] == "speech"
+            assert msg["text"] == "hello"
+            assert "role" not in msg
+            assert "team" not in msg
+            assert "reasoning" not in msg
+            assert "thought" not in msg
+            assert "teammates" not in msg
+
+
+@pytest.mark.asyncio
+async def test_private_reasoning_uses_admin_trace_only_and_never_websocket(client, manager):
+    room_id, admin_token, seat_tokens = _create_room(client, human_seats=[1])
+    client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
+
+    room = manager.get_room(room_id)
+    assert room is not None and room.orchestrator is not None
+    marker = "model-private-reasoning-ws-sentinel"
+
+    with (
+        client.websocket_connect(f"/ws/{room_id}?mode=spectate") as spectate_ws,
+        client.websocket_connect(
+            f"/ws/{room_id}?mode=play&seat=1&token={seat_tokens['1']}"
+        ) as play_ws,
+        client.websocket_connect(f"/ws/{room_id}?mode=god&token={admin_token}") as god_ws,
+    ):
+        for websocket in (spectate_ws, play_ws, god_ws):
+            assert websocket.receive_json()["type"] == "snapshot"
+
+        room.orchestrator.on_trace({
+            "type": "agent_response",
+            "seat": 2,
+            "phase": "day",
+            "envelope": {
+                "decision": {
+                    "action": "speak",
+                    "speech": "public cover story",
+                    "reasoning": marker,
+                },
+            },
+        })
+
+        trace = client.get(
+            f"/api/rooms/{room_id}/trace",
+            headers=_admin_headers(admin_token),
+        )
+        assert trace.status_code == 200
+        decision = next(
+            item for item in trace.json()["trace"]
+            if item["kind"] == "decision" and item["payload"].get("envelope")
+        )
+        assert decision["payload"]["envelope"]["decision"]["reasoning"] == marker
+
+        # Recording a decision trace does not create a game event on any live
+        # stream, including the admin-authenticated god stream.
+        for websocket in (spectate_ws, play_ws, god_ws):
+            with pytest.raises(Exception):
+                websocket.receive_json(timeout=0.2)
+
+        await room.orchestrator.on_event({
+            "type": "speech",
+            "phase": "day",
+            "day": 1,
+            "seat": 2,
+            "name": "B",
+            "text": "public cover story",
+            "reasoning": marker,
+            "nested": {
+                "thought": marker,
+                "items": [{"private_reasoning": marker}],
+            },
+        })
+        for websocket in (spectate_ws, play_ws, god_ws):
+            delivered = websocket.receive_json()
+            assert delivered["type"] == "speech"
+            assert marker not in json.dumps(delivered, ensure_ascii=False)
+
+    event_artifacts = {
+        "event_history": room.event_history,
+        "delivery_source_history": [item[1] for item in room.delivery_source_history],
+        "delivery_streams": {
+            key: [record.payload for record in stream.history]
+            for key, stream in room.delivery_streams.items()
+        },
+    }
+    assert marker not in json.dumps(event_artifacts, ensure_ascii=False, default=str)
+
+    for actor in room.actors.values():
+        memory = [
+            {"text": item.text, "metadata": item.metadata}
+            for item in actor.memory.observations
+        ]
+        assert marker not in json.dumps(memory, ensure_ascii=False, default=str)
+    for player in room.state.players:
+        observation = build_observation(room.state, player.id).model_dump()
+        assert marker not in json.dumps(observation, ensure_ascii=False, default=str)
+
+    public_room = client.get(f"/api/rooms/{room_id}")
+    assert public_room.status_code == 200
+    assert marker not in json.dumps(public_room.json(), ensure_ascii=False)
+
+
+@pytest.mark.asyncio
 async def test_spectator_night_resolved_hides_death_reason_live_and_history(client, manager):
     room_id, admin_token, _ = _create_room(client)
     client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
@@ -301,80 +584,51 @@ async def test_spectator_agent_decision_failed_hides_raw_night_details(client, m
         ws.receive_json()
         await room.orchestrator.on_event(event)
         msg = ws.receive_json()
-        assert msg == {
+        assert msg["delivery_seq"] >= 1
+        assert isinstance(msg["delivery_id"], str)
+        assert {
+            key: value
+            for key, value in msg.items()
+            if key not in {"delivery_seq", "delivery_id"}
+        } == {
             "type": "agent_decision_failed",
             "phase": "night",
-            "reason": "AI 决策失败,已按规则跳过。",
+            "reason": "AI 决策失败,本请求未产生 DecisionEnvelope。",
+            "agent_kind": "llm",
             "timeout": True,
         }
 
 
 @pytest.mark.asyncio
-async def test_spectator_thinking_stream_hides_full_reasoning(client, manager):
-    """观战只收整理摘要;完整 reasoning 只给 god 模式。"""
+async def test_live_analysis_remains_factual_without_synthetic_social_metrics(client, manager):
+    """Final analysis is forwarded without adding inferred social scores."""
     room_id, admin_token, _ = _create_room(client)
     client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
 
     room = manager.get_room(room_id)
     assert room is not None and room.orchestrator is not None
 
-    with (
-        client.websocket_connect(f"/ws/{room_id}?mode=spectate") as spectate_ws,
-        client.websocket_connect(f"/ws/{room_id}?mode=god&token={admin_token}") as god_ws,
-    ):
-        spectate_ws.receive_json()  # snapshot
-        god_ws.receive_json()  # snapshot
+    with client.websocket_connect(f"/ws/{room_id}?mode=god&token={admin_token}") as god_ws:
+        god_ws.receive_json()
 
-        thinking = {
-            "seat": 3,
-            "action": "speak",
-            "summary": "我会观察公开发言。",
-            "reasoning": "我是狼人,这轮要误导好人投4号。",
-            "suspicion_top": [{"seat": 4, "suspicion": 0.7}],
-        }
-        await room.orchestrator.on_thinking(thinking)
+        await room.orchestrator.on_event({
+            "type": "speech",
+            "phase": "day",
+            "day": 1,
+            "seat": 1,
+            "name": "A",
+            "text": "我觉得2号需要解释一下。",
+            "reply_to": 2,
+            "accuses": [2],
+        })
+        god_ws.receive_json()
 
-        spectate_msg = spectate_ws.receive_json()
-        god_msg = god_ws.receive_json()
+        await room.orchestrator.on_event({
+            "type": "analysis",
+            "analysis": {"winner": "village", "days": 1, "seats": []},
+        })
+        msg = god_ws.receive_json()
 
-        assert spectate_msg["type"] == "agent_thinking"
-        assert spectate_msg["summary"] == "AI 思考已记录,隐藏推理赛后由授权复盘查看。"
-        assert "reasoning" not in spectate_msg
-        assert "suspicion_top" not in spectate_msg
-
-        assert god_msg["type"] == "agent_thinking"
-        assert god_msg["reasoning"] == "我是狼人,这轮要误导好人投4号。"
-
-
-@pytest.mark.asyncio
-async def test_spectator_does_not_receive_night_thinking_but_god_does(client, manager):
-    """夜间思考即使脱敏也会泄露角色行动,只能给 god。"""
-    room_id, admin_token, _ = _create_room(client)
-    client.post(f"/api/rooms/{room_id}/start", headers=_admin_headers(admin_token))
-
-    room = manager.get_room(room_id)
-    assert room is not None and room.orchestrator is not None
-
-    with (
-        client.websocket_connect(f"/ws/{room_id}?mode=spectate") as spectate_ws,
-        client.websocket_connect(f"/ws/{room_id}?mode=god&token={admin_token}") as god_ws,
-    ):
-        spectate_ws.receive_json()  # snapshot
-        god_ws.receive_json()  # snapshot
-
-        thinking = {
-            "seat": 5,
-            "action": "night_kill",
-            "summary": "夜间决策已记录。",
-            "reasoning": "我是狼人,今晚准备刀2号。",
-            "suspicion_top": [{"seat": 2, "suspicion": 0.8}],
-        }
-        await room.orchestrator.on_thinking(thinking)
-
-        god_msg = god_ws.receive_json()
-        assert god_msg["type"] == "agent_thinking"
-        assert god_msg["action"] == "night_kill"
-        assert god_msg["reasoning"] == "我是狼人,今晚准备刀2号。"
-
-        with pytest.raises(Exception):
-            spectate_ws.receive_json(timeout=0.2)
+        assert msg["type"] == "analysis"
+        assert msg["analysis"] == {"winner": "village", "days": 1, "seats": []}
+        assert "social_metrics" not in msg["analysis"]

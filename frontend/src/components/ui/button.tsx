@@ -30,7 +30,7 @@ const buttonVariants = cva(
         "icon-xs":
           "size-6 rounded-[min(var(--radius-md),10px)] in-data-[slot=button-group]:rounded-lg [&_svg:not([class*='size-'])]:size-3",
         "icon-sm":
-          "size-8 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
+          "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
         "icon-lg": "size-9",
       },
     },
@@ -41,27 +41,31 @@ const buttonVariants = cva(
   }
 )
 
-type ButtonProps = React.ComponentPropsWithoutRef<"button"> &
+type ButtonProps = React.ComponentProps<"button"> &
   VariantProps<typeof buttonVariants> & {
     asChild?: boolean
   }
 
-const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant = "default", size = "default", asChild = false, ...props }, ref) => {
-    const Comp = asChild ? Slot.Root : "button"
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({
+  className,
+  variant = "default",
+  size = "default",
+  asChild = false,
+  ...props
+}, ref) => {
+  const Comp = asChild ? Slot.Root : "button"
 
-    return (
-      <Comp
-        ref={ref}
-        data-slot="button"
-        data-variant={variant}
-        data-size={size}
-        className={cn(buttonVariants({ variant, size, className }))}
-        {...props}
-      />
-    )
-  }
-)
+  return (
+    <Comp
+      ref={ref}
+      data-slot="button"
+      data-variant={variant}
+      data-size={size}
+      className={cn(buttonVariants({ variant, size, className }))}
+      {...props}
+    />
+  )
+})
 Button.displayName = "Button"
 
 export { Button, buttonVariants }

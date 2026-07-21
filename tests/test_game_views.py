@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+from src.agent.information import build_observation
+from src.game.models import Event, EventVisibility, Phase
 from src.game.roles import Role
 from src.game.state import new_game
 
@@ -57,3 +61,57 @@ def test_private_view_exposes_only_own_role_resource_state() -> None:
         assert "witch_poison" not in view
         assert "last_guarded_seat" not in view
         assert "pending_hunter" not in view
+
+
+def test_game_views_and_agent_observation_strip_nested_model_reasoning() -> None:
+    state = new_game(["A", "B", "C", "D", "E", "F"])
+    viewer = state.players[0]
+    marker = "model-private-reasoning-sentinel"
+    state.events.extend([
+        Event(
+            phase=Phase.DAY,
+            day=1,
+            type="speech",
+            message="public statement",
+            payload={
+                "reasoning": marker,
+                "nested": {
+                    "thought": marker,
+                    "items": [{"private_reasoning": marker, "visible": "kept"}],
+                },
+            },
+        ),
+        Event(
+            phase=Phase.NIGHT,
+            day=1,
+            type="seer_result",
+            message="private result",
+            visibility=EventVisibility.PRIVATE,
+            recipients=[viewer.id],
+            payload={
+                "target_seat": 2,
+                "nested": {
+                    "reasoning": marker,
+                    "thought": marker,
+                    "private_reasoning": marker,
+                    "visible": "kept",
+                },
+            },
+        ),
+    ])
+
+    projected = (
+        state.public_view(),
+        state.private_view_for(viewer.id),
+        build_observation(state, viewer.id).model_dump(),
+    )
+    for value in projected:
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+        assert marker not in serialized
+        for field in ("reasoning", "thought", "private_reasoning"):
+            assert f'"{field}"' not in serialized
+
+    # Projection is read-only: trusted server state still has its original
+    # malformed payload, while no player-facing view can observe it.
+    assert state.events[0].payload["reasoning"] == marker
+    assert state.events[1].payload["nested"]["private_reasoning"] == marker

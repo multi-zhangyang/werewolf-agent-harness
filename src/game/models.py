@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
+from ..privacy import strip_model_private_reasoning
 from .roles import Role, Team, role_team
 
 
@@ -170,7 +171,10 @@ class GameState(BaseModel):
             "phase": self.phase,
             "day": self.day,
             "players": [player.public_view() for player in self.players],
-            "events": [event.model_dump() for event in self.public_events()],
+            "events": [
+                strip_model_private_reasoning(event.model_dump())
+                for event in self.public_events()
+            ],
             "votes": dict(self.votes) if self.phase in {Phase.VOTING, Phase.DAY} else {},
             "winner": self.winner,
         }
@@ -180,7 +184,10 @@ class GameState(BaseModel):
         view = {
             **self.public_view(),
             "self": viewer.private_view(),
-            "events": [event.model_dump() for event in self.events_for(player_id)],
+            "events": [
+                strip_model_private_reasoning(event.model_dump())
+                for event in self.events_for(player_id)
+            ],
         }
         role = Role(viewer.role) if viewer.role is not None else None
         if role == Role.WITCH:

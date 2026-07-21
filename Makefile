@@ -2,7 +2,15 @@ PYTHON ?= python
 PYTEST ?= pytest
 FRONTEND_DIR ?= frontend
 
-.PHONY: install install-py install-ui dev-api dev-ui build-ui test test-py test-ui smoke-real stats-dryrun
+.PHONY: install install-py install-ui dev-api dev-ui build-ui test test-py test-ui test-browser harness-real harness-core-real harness-verify
+
+HARNESS_SEED ?= 100
+HARNESS_RUNS ?= 1
+HARNESS_POLICIES ?= fixed_round_robin
+ARTIFACT_ROOT ?= artifacts
+SMOKE_RUN_DIR ?=
+CORE_SPEC ?=
+CORE_PLUGIN ?=
 
 install: install-py install-ui
 
@@ -29,8 +37,17 @@ test-py:
 test-ui:
 	cd $(FRONTEND_DIR) && npm run build
 
-smoke-real:
-	PYTHONPATH=. $(PYTHON) tests/smoke_e2e.py
+test-browser: build-ui
+	NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost WEREWOLF_RUN_BROWSER_E2E=1 PYTHONPATH=. $(PYTHON) -m $(PYTEST) -q tests/test_browser_replay_e2e.py tests/test_browser_live_matrix_e2e.py
 
-stats-dryrun:
-	PYTHONPATH=. $(PYTHON) tests/multi_game_stats.py 0 --jsonl logs/multi_game_stats_dryrun.jsonl --bootstrap-iters 10
+harness-real:
+	PYTHONPATH=. $(PYTHON) -m src.harness.cli --seed $(HARNESS_SEED) --runs $(HARNESS_RUNS) --turn-policies $(HARNESS_POLICIES) --artifact-root $(ARTIFACT_ROOT)
+
+harness-core-real:
+	@test -n "$(CORE_SPEC)" || (echo "CORE_SPEC is required" >&2; exit 2)
+	@test -n "$(CORE_PLUGIN)" || (echo "CORE_PLUGIN is required" >&2; exit 2)
+	PYTHONPATH=. $(PYTHON) -m src.harness.core_cli --spec "$(CORE_SPEC)" --plugin "$(CORE_PLUGIN)" --artifact-root $(ARTIFACT_ROOT) --verify-smoke
+
+harness-verify:
+	@test -n "$(SMOKE_RUN_DIR)" || (echo "SMOKE_RUN_DIR is required" >&2; exit 2)
+	PYTHONPATH=. $(PYTHON) -m src.harness.smoke "$(SMOKE_RUN_DIR)"

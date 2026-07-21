@@ -1,57 +1,52 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, CheckCircle2, Clock3, Send, SkipForward, Target } from "lucide-react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { Textarea } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import type { GameState } from "../lib/store";
+import { ACTION_LABEL, actionHint, humanActionControls } from "@/lib/human-actions";
+import type { GameState } from "@/lib/store";
 import { RoleAvatar } from "./RoleAvatar";
-
-const ACTION_LABEL: Record<string, string> = {
-  speak: "发言",
-  vote: "投票放逐",
-  night_action: "夜间行动",
-  night_kill: "夜间击杀",
-  see: "查验身份",
-  save: "使用解药",
-  poison: "使用毒药",
-  guard: "守护玩家",
-  hunter_shot: "猎人开枪",
-  last_words: "遗言",
-  skip: "弃权",
-};
 
 export function HumanActionPanel({
   state,
   onSubmit,
   className,
-  showTextEditor = true,
 }: {
   state: GameState;
-  onSubmit: (action: string, data: Record<string, any>) => void;
+  onSubmit: (action: string, data: Record<string, any>) => boolean;
   className?: string;
-  showTextEditor?: boolean;
 }) {
   const req = state.pendingHuman;
-  const [text, setText] = useState("");
   const [target, setTarget] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
-  const actionType = req?.actionType || "";
-  const action = resolveAction(actionType, req?.context);
-  const textAction = action === "speak" || action === "last_words";
-  const targetAction = needsTarget(action);
-  const targets = useMemo(() => humanTargets(state, action, req?.context), [state, action, req?.context]);
+  const [submitStatus, setSubmitStatus] = useState<"ready" | "submitted" | "error">("ready");
+  const [submittedAt, setSubmittedAt] = useState<number | null>(null);
+  const controls = useMemo(
+    () => req ? humanActionControls(state, req.actionType, req.context) : null,
+    [req, state.seats],
+  );
+  const schema = controls?.ok ? controls.schema : null;
+  const action = schema?.action || "";
+  const targets = controls?.ok ? controls.targets : [];
+  const targetAction = schema?.requiresTarget === true;
+  const textAction = schema?.inputKind === "text";
+  const canSkip = schema?.canSkip === true;
+  const schemaError = controls && !controls.ok ? controls.reason : null;
+  const targetKey = schema?.targetSeats.join(",") || "";
   const remainingMs = Math.max(0, (req?.deadline || now) - now);
-  const timeoutRaw = Number(req?.context?.timeout_ms || req?.context?.timeout || 60_000);
+  const timeoutRaw = Number(req?.timeoutMs || req?.context?.timeout_ms || req?.context?.timeout || 60_000);
   const timeoutMs = Math.max(1, timeoutRaw < 1000 ? timeoutRaw * 1000 : timeoutRaw);
   const progress = req ? Math.max(0, Math.min(100, (remainingMs / timeoutMs) * 100)) : 0;
+  const expired = Boolean(req && remainingMs <= 0);
+  const disconnected = !state.connected;
+  const submitted = submitStatus === "submitted";
 
   useEffect(() => {
     if (!req) {
-      setText("");
       setTarget(null);
       return;
     }
@@ -61,155 +56,216 @@ export function HumanActionPanel({
   }, [req]);
 
   useEffect(() => {
-    setText("");
     setTarget(null);
-  }, [req?.actionType, req?.deadline]);
+    setSubmitStatus("ready");
+    setSubmittedAt(null);
+  }, [req?.requestId, req?.actionType, req?.deadline]);
+
+  useEffect(() => {
+    if (target !== null && (!schema || !schema.targetSeats.includes(target))) {
+      setTarget(null);
+    }
+  }, [schema, target, targetKey]);
+
+  useEffect(() => {
+    if (submitStatus === "submitted" && !state.connected) {
+      setSubmitStatus("ready");
+      setSubmittedAt(null);
+    }
+  }, [state.connected, submitStatus]);
+
+  useEffect(() => {
+    if (submitStatus !== "submitted" || submittedAt == null) return;
+    const rejected = [...state.log]
+      .reverse()
+      .find((entry) => (
+        entry.kind === "failed"
+        && entry.seat === state.mySeat
+        && entry.ts >= submittedAt
+        && entry.text.startsWith("真人操作被拒绝")
+      ));
+    if (rejected) {
+      setSubmitStatus("ready");
+      setSubmittedAt(null);
+    }
+  }, [state.log, state.mySeat, submitStatus, submittedAt]);
 
   if (!req) {
     return (
-      <Card className={cn("bg-card/95", className)} size="sm">
-        <CardContent className="space-y-2 px-3">
-          <div className="flex items-center gap-2 text-sm font-medium">
+      <Card size="sm" className={className}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
             <CheckCircle2 className="size-4 text-emerald-500" />
             暂无真人操作
-          </div>
-          <p className="text-sm leading-6 text-muted-foreground">真实事件会在轮到你的座位时请求操作。</p>
-        </CardContent>
+          </CardTitle>
+          <CardDescription>真实事件会在轮到你的座位时请求操作。</CardDescription>
+        </CardHeader>
       </Card>
     );
   }
 
-  const submit = () => {
-    const data: Record<string, any> = {};
-    if (textAction) data.speech = text.trim();
-    if (targetAction) data.target_seat = target;
-    onSubmit(action, data);
+  const submitAction = (nextAction: string, data: Record<string, any>) => {
+    if (expired || disconnected || submitted) return;
+    setSubmitStatus("submitted");
+    setSubmittedAt(Date.now());
+    const ok = onSubmit(nextAction, data);
+    if (!ok) {
+      setSubmitStatus("error");
+      setSubmittedAt(null);
+    }
   };
-  const disabled = (targetAction && target === null) || (textAction && showTextEditor && !text.trim());
+
+  const submit = () => {
+    if (targetAction) submitAction(action, { target_seat: target });
+  };
 
   return (
-    <Card className={cn("border-primary/35 bg-primary/5", className)} size="sm">
-      <CardHeader className="px-3">
-        <CardTitle className="flex flex-wrap items-center justify-between gap-2">
-          <span className="flex items-center gap-2">
-            <AlertCircle className="size-4" />
-            轮到你了
-          </span>
-          <Badge>{ACTION_LABEL[action] || ACTION_LABEL[actionType] || actionType}</Badge>
+    <Card size="sm" className={cn("border-primary/30", className)}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <AlertCircle className="size-4" />
+          轮到你了
         </CardTitle>
+        <CardDescription>
+          {schemaError
+            ? "environment 返回的操作 schema 不完整，客户端已禁止提交。"
+            : textAction
+              ? "在 Harness Console 底部输入本次公开输出。"
+              : actionHint(action)}
+        </CardDescription>
+        <CardAction>
+          <Badge>{ACTION_LABEL[action] || req.actionType}</Badge>
+        </CardAction>
       </CardHeader>
-      <CardContent className="space-y-3 px-3">
+
+      <CardContent className="space-y-4">
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <Clock3 className="size-3.5" />
-              剩余 {Math.ceil(remainingMs / 1000)} 秒
+              {expired ? "等待系统处理" : `剩余 ${Math.ceil(remainingMs / 1000)} 秒`}
             </span>
             <span>第 {state.day || 0} 天 · {phaseLabel(state.phase)}</span>
           </div>
           <Progress value={progress} />
         </div>
 
-        <p className="text-sm leading-6 text-muted-foreground">{actionHint(action, showTextEditor)}</p>
+        {expired && (
+          <Alert>
+            <Clock3 className="size-4" />
+            <AlertTitle>操作时间已到</AlertTitle>
+            <AlertDescription>等待后端结算本次超时结果。</AlertDescription>
+          </Alert>
+        )}
+        {disconnected && !expired && (
+          <Alert variant="destructive">
+            <AlertCircle className="size-4" />
+            <AlertTitle>连接中断</AlertTitle>
+            <AlertDescription>正在重连，连接恢复后再提交本次操作。</AlertDescription>
+          </Alert>
+        )}
 
-        {textAction && showTextEditor && (
-          <Textarea
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            placeholder={action === "last_words" ? "留下遗言" : "输入你的发言"}
-            rows={4}
-            className="text-base leading-7"
-          />
+        {schemaError && (
+          <Alert variant="destructive">
+            <AlertCircle className="size-4" />
+            <AlertTitle>ActionRequest schema 无法安全渲染</AlertTitle>
+            <AlertDescription>
+              请求已 fail-closed（{schemaError}），等待 environment 终结或替换该请求。
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {submitted && (
+          <Alert>
+            <CheckCircle2 className="size-4 text-emerald-500" />
+            <AlertTitle>已提交，等待确认</AlertTitle>
+            <AlertDescription>后端确认前会锁定本次选择，避免重复提交。</AlertDescription>
+          </Alert>
+        )}
+        {submitStatus === "error" && !submitted && (
+          <Alert variant="destructive">
+            <AlertCircle className="size-4" />
+            <AlertTitle>提交失败</AlertTitle>
+            <AlertDescription>请检查连接状态后重新提交。</AlertDescription>
+          </Alert>
+        )}
+
+        {textAction && (
+          <Alert>
+            <CheckCircle2 className="size-4 text-emerald-500" />
+            <AlertTitle>公开输出在 Console 底部提交</AlertTitle>
+            <AlertDescription>提交内容会作为本次 Decision 的公开文本原样进入 transcript。</AlertDescription>
+          </Alert>
         )}
 
         {targetAction && (
-          <div className="grid gap-2">
-            {targets.map((seat) => {
-              const selected = target === seat.seat;
-              return (
-                <Button
-                  key={seat.seat}
-                  type="button"
-                  variant={selected ? "default" : "outline"}
-                  className="h-auto justify-start gap-3 px-3 py-2.5 text-left"
-                  onClick={() => setTarget(seat.seat)}
-                >
-                  <RoleAvatar role={seat.role} team={seat.team} seat={seat.seat} alive={seat.alive} reveal={seat.seat === state.mySeat || state.mode === "god" || state.status === "ended"} size="sm" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate font-medium">{seat.seat}号 · {seat.name}</span>
-                    <span className="block text-xs text-muted-foreground">{seat.alive ? "存活" : "出局"}</span>
-                  </span>
-                  {selected && <Target className="size-4" />}
-                </Button>
-              );
-            })}
-            {targets.length === 0 && (
-              <Alert>
-                <AlertDescription>当前没有可选目标，可以选择弃权。</AlertDescription>
-              </Alert>
-            )}
-          </div>
+          <ScrollArea className="h-[42svh] max-h-80" viewportClassName="pr-3">
+            <div className="grid gap-2">
+              {targets.map((seat) => {
+                const selected = target === seat.seat;
+                return (
+                  <Button
+                    key={seat.seat}
+                    type="button"
+                    variant={selected ? "default" : "outline"}
+                    className="h-auto justify-start gap-3 px-3 py-2.5 text-left"
+                    disabled={expired || disconnected || submitted}
+                    onClick={() => {
+                      setTarget(seat.seat);
+                      if (submitStatus === "error") setSubmitStatus("ready");
+                    }}
+                  >
+                    <RoleAvatar
+                      role={seat.role}
+                      team={seat.team}
+                      seat={seat.seat}
+                      alive={seat.alive}
+                      reveal={seat.seat === state.mySeat || state.mode === "god" || state.status === "ended"}
+                      size="default"
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium">{seat.seat}号 · {seat.name}</span>
+                      <span className="block text-xs text-muted-foreground">{seat.alive ? "存活" : "出局"}</span>
+                    </span>
+                    {selected && <Target className="size-4" />}
+                  </Button>
+                );
+              })}
+              {targets.length === 0 && (
+                <Alert>
+                  <AlertDescription>
+                    {canSkip
+                      ? "当前没有可选目标，可以显式弃权。"
+                      : "当前请求没有合法目标且不允许弃权，environment 将记录失败。"}
+                  </AlertDescription>
+                </Alert>
+              )}
+            </div>
+          </ScrollArea>
         )}
-
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button variant="ghost" onClick={() => onSubmit("skip", {})} className="gap-2">
-            <SkipForward className="size-4" />
-            弃权
-          </Button>
-          {(showTextEditor || targetAction) && (
-            <Button onClick={submit} disabled={disabled} className="gap-2">
-              <Send className="size-4" />
-              确认
-            </Button>
-          )}
-        </div>
       </CardContent>
+
+      <CardFooter className="justify-end gap-2">
+        {canSkip && (
+          <Button
+            variant="ghost"
+            onClick={() => submitAction("skip", {})}
+            disabled={expired || disconnected || submitted}
+            className="gap-2"
+          >
+            <SkipForward className="size-4" />
+            {submitted ? "等待确认" : "弃权"}
+          </Button>
+        )}
+        {targetAction && (
+          <Button onClick={submit} disabled={expired || disconnected || submitted || target === null} className="gap-2">
+            <Send className="size-4" />
+            {submitted ? "等待确认" : "确认"}
+          </Button>
+        )}
+      </CardFooter>
     </Card>
   );
-}
-
-function resolveAction(actionType: string, context: any): string {
-  const requested = typeof context?.requested_action === "string" ? context.requested_action : "";
-  if (requested) return requested;
-  if (actionType !== "night_action") return actionType;
-  const role = String(context?.role || "");
-  if (role === "werewolf") return "night_kill";
-  if (role === "seer") return "see";
-  if (role === "guard") return "guard";
-  if (role === "witch") return "poison";
-  if (role === "hunter") return "hunter_shot";
-  return "skip";
-}
-
-function needsTarget(action: string): boolean {
-  return ["night_kill", "see", "save", "poison", "guard", "hunter_shot", "vote"].includes(action);
-}
-
-function humanTargets(state: GameState, action: string, context: any): GameState["seats"] {
-  if (action === "save") {
-    const killedSeat = Number(context?.killed_seat);
-    const target = state.seats.find((seat) => seat.seat === killedSeat && seat.alive);
-    return target ? [target] : [];
-  }
-  if (needsTarget(action)) return state.seats.filter((seat) => seat.alive && seat.seat !== state.mySeat);
-  return [];
-}
-
-function actionHint(action: string, showTextEditor: boolean): string {
-  if ((action === "speak" || action === "last_words") && !showTextEditor) {
-    return "在证词流底部输入并发送，发言会进入真实对局。";
-  }
-  return {
-    night_kill: "选择今晚的击杀目标。",
-    see: "选择你要查验的玩家。",
-    save: "确认是否救下今晚被击杀的玩家。",
-    poison: "选择你要毒杀的玩家，或弃权保留毒药。",
-    guard: "选择你要守护的玩家。",
-    hunter_shot: "选择你要带走的玩家。",
-    vote: "选择你要放逐的玩家。",
-    speak: "输入你的发言，参与白天讨论。",
-    last_words: "留下你的遗言。",
-  }[action] || "提交你的操作。";
 }
 
 function phaseLabel(phase: string): string {

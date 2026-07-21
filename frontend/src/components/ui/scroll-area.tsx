@@ -3,6 +3,8 @@ import { ScrollArea as ScrollAreaPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 
+const RADIX_SCROLLAREA_STYLE_PREFIX = "[data-radix-scroll-area-viewport]"
+
 function ScrollArea({
   className,
   viewportClassName,
@@ -15,8 +17,21 @@ function ScrollArea({
   viewportRef?: React.Ref<HTMLDivElement>
   onViewportScroll?: React.UIEventHandler<HTMLDivElement>
 }) {
+  const rootRef = React.useRef<HTMLDivElement>(null)
+
+  React.useLayoutEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+    for (const styleNode of root.querySelectorAll("style")) {
+      if (styleNode.textContent?.startsWith(RADIX_SCROLLAREA_STYLE_PREFIX)) {
+        styleNode.remove()
+      }
+    }
+  })
+
   return (
     <ScrollAreaPrimitive.Root
+      ref={rootRef}
       data-slot="scroll-area"
       className={cn("relative overflow-hidden", className)}
       {...props}
@@ -26,7 +41,7 @@ function ScrollArea({
         onScroll={onViewportScroll}
         data-slot="scroll-area-viewport"
         className={cn(
-          "size-full rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1",
+          "size-full min-w-0 rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1 [&>div]:!block [&>div]:!min-w-0 [&>div]:!w-full",
           viewportClassName
         )}
       >

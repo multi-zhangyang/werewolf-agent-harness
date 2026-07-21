@@ -44,7 +44,7 @@ export function LobbyView({ onCreated }: { onCreated: (roomId: string, auth: Roo
           ...prev,
           provider: config.provider || prev.provider || "openai",
           model: config.model || "",
-          api_base: config.api_base || "",
+          api_base: "",
           temperature: config.temperature ?? 0.85,
           max_tokens: config.max_tokens ?? 0,
           use_json_format: config.use_json_format ?? false,
@@ -85,7 +85,7 @@ export function LobbyView({ onCreated }: { onCreated: (roomId: string, auth: Roo
   };
 
   return (
-    <div className="grid min-h-[calc(100svh-72px)] gap-4 pb-[calc(5rem+env(safe-area-inset-bottom))] lg:grid-cols-[minmax(0,1fr)_380px] lg:pb-0 xl:grid-cols-[minmax(0,1fr)_420px]">
+    <div className="grid min-h-[calc(100svh-72px)] gap-4 lg:grid-cols-[minmax(0,1fr)_380px] xl:grid-cols-[minmax(0,1fr)_420px]">
       <Card className="min-h-0 bg-card/95 shadow-sm">
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -303,13 +303,6 @@ export function LobbyView({ onCreated }: { onCreated: (roomId: string, auth: Roo
           </CardFooter>
         </Card>
       </aside>
-
-      <div className="fixed inset-x-0 bottom-0 z-40 border-t bg-card/95 px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] shadow-lg backdrop-blur lg:hidden">
-        <Button className="w-full gap-2" disabled={busy} onClick={submit}>
-          {busy ? "创建中..." : `创建 ${names.length} 人房间`}
-          <ArrowRight className="size-4" />
-        </Button>
-      </div>
     </div>
   );
 }

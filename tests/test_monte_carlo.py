@@ -9,13 +9,39 @@ from collections import Counter
 
 import pytest
 
-from src.game.models import NightAction, NightActionType, Vote
+from src.game.models import NightAction, NightActionType, Phase, Vote
 from src.game.roles import Role, default_role_deck
 from src.game.rules import RulesEngine
 from src.game.state import new_game
 
 
 NAMES = ["A", "B", "C", "D", "E", "F"]
+
+
+def _legal_vote_targets(state, voter_id: str):
+    living = state.living_players()
+    pk_ids = set(state.pk_candidates)
+    return [
+        player for player in living
+        if player.id != voter_id and (not pk_ids or player.id in pk_ids)
+    ]
+
+
+def _finish_if_winner(state) -> bool:
+    winner = RulesEngine.check_winner(state)
+    if winner is None:
+        return False
+    state.winner = winner
+    state.phase = Phase.ENDED
+    return True
+
+
+def _resolve_vote_and_advance(state) -> None:
+    RulesEngine.resolve_vote(state)
+    if state.pk_candidates or _finish_if_winner(state):
+        return
+    state.phase = Phase.NIGHT
+    state.day += 1
 
 
 def _simulate_random(seed: int) -> str:
@@ -40,6 +66,7 @@ def _simulate_random(seed: int) -> str:
                     ),
                 )
             RulesEngine.resolve_night(state)
+            _finish_if_winner(state)
         elif state.phase.value in ("day", "voting"):
             living = state.living_players()
             if len(living) <= 2:
@@ -48,11 +75,12 @@ def _simulate_random(seed: int) -> str:
                 RulesEngine.start_vote(state)
             votes = {}
             for p in living:
-                others = [x for x in living if x.id != p.id]
-                votes[p.id] = rng.choice(others).id
+                legal_targets = _legal_vote_targets(state, p.id)
+                if legal_targets:
+                    votes[p.id] = rng.choice(legal_targets).id
             for voter, target in votes.items():
                 RulesEngine.submit_vote(state, Vote(voter_id=voter, target_id=target))
-            RulesEngine.resolve_vote(state)
+            _resolve_vote_and_advance(state)
     return state.winner.value if state.winner else "draw"
 
 
@@ -91,6 +119,7 @@ def _simulate_seer_reveal(seed: int) -> str:
                     ),
                 )
             RulesEngine.resolve_night(state)
+            _finish_if_winner(state)
         elif state.phase.value in ("day", "voting"):
             living = state.living_players()
             if len(living) <= 2:
@@ -102,13 +131,15 @@ def _simulate_seer_reveal(seed: int) -> str:
                 if team == "werewolves" and any(p.seat == seat and p.alive for p in living)
             ]
             for p in living:
-                if known_wolves:
-                    target = next(x for x in living if x.seat == known_wolves[0])
-                else:
-                    others = [x for x in living if x.id != p.id]
-                    target = rng.choice(others)
+                legal_targets = _legal_vote_targets(state, p.id)
+                if not legal_targets:
+                    continue
+                known_legal_wolves = [
+                    target for target in legal_targets if target.seat in known_wolves
+                ]
+                target = known_legal_wolves[0] if known_legal_wolves else rng.choice(legal_targets)
                 RulesEngine.submit_vote(state, Vote(voter_id=p.id, target_id=target.id))
-            RulesEngine.resolve_vote(state)
+            _resolve_vote_and_advance(state)
     return state.winner.value if state.winner else "draw"
 
 

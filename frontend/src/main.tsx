@@ -4,8 +4,6 @@ import App from "./App";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./styles/global.css";
 
-document.documentElement.classList.add("dark");
-
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <TooltipProvider>

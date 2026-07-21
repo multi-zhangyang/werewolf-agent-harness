@@ -1,55 +1,102 @@
-"""Agent 执行器 —— 决策编排 + 清洗校验 + 异步反思。
+"""LLM/human agent adapter for the harness decision protocol.
 
-承 no-fallback-design 铁律(ARCHITECTURE.md §3.1, §9):
+Agent decision boundary:
 - 每个 AI 决策必须来自真实 LLM 调用,绝不伪造。
-- 失败走深度重试(解析失败标记后由上层编排器重试);彻底失败抛 AgentDecisionError。
-- 清洗:目标非法时按真实意图就近修正(选最近合法目标)或落入合法 SKIP,但带 skip_reason 透明审计。
+- Router 重试瞬时网络故障；Actor 只重试不完整/不合格的模型响应。
+- 彻底失败抛 AgentDecisionError。
+- JSON/response failures produce no envelope; invalid target intent remains in
+  the envelope so protocol validation can reject it without inventing SKIP.
 - reasoning 私有保存(上帝/复盘可见,不广播)。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
+import time
 from typing import Any, Awaitable, Callable
 
-from ..game.models import GameState
+from pydantic import ValidationError
+
 from ..game.roles import Role
 from ..llm.models import ModelConfig
-from ..llm.router import LLMError, LLMRouter
+from ..llm.router import LLMError, LLMResponseError, LLMRouter
+from ..harness.agent_protocol import ActionRequest, DecisionEnvelope
+from ..harness.errors import AgentDecisionError
+from .cognition import PrivateAgentState
 from .memory import AgentMemory
 from .prompts import (
     assign_persona,
     build_messages,
+    build_tool_loop_turn,
     last_words_instruction,
     night_action_instruction,
-    parse_suspicion,
-    reflection_instruction,
     render_observation,
     role_prompt,
     speak_instruction,
     vote_instruction,
+    wolf_council_instruction,
 )
-from .schemas import AgentAction, AgentThinking, Decision
-from .information import attach_today_speeches, build_observation
+from .schemas import AgentAction, AgentObservation, Decision
+from .session import AgentSession, AgentSessionError, AgentSessionLimits
+from .werewolf_tools import build_werewolf_tool_registry
 
 logger = logging.getLogger(__name__)
 
-DECISION_MAX_ATTEMPTS = 5
-REFLECTION_MAX_ATTEMPTS = 2
+DECISION_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY_SECONDS = 0.05
 RETRY_MAX_DELAY_SECONDS = 0.8
-
-
-class AgentDecisionError(RuntimeError):
-    """Agent 决策彻底失败(真实 LLM 重试耗尽)。由编排器决定 _legal_skip。"""
+# Real models often spend several turns reading private/public state and
+# repairing a rejected cognition update before emitting the terminal action.
+# Keep the loop bounded, but do not make the actor stricter than the generic
+# AgentSession default; the outer decision deadline and tool-call cap remain
+# independent hard limits.
+TOOL_LOOP_MAX_STEPS = 12
+# Response-shape retries are provider generations too, even though they do not
+# advance the logical tool-loop step.  Bound them independently per request.
+TOOL_LOOP_MAX_GENERATIONS = 18
+TOOL_LOOP_MAX_TOOL_CALLS = 24
+TOOL_LOOP_MAX_NO_PROGRESS = 5
+# This is cumulative provider-reported usage for one ActionRequest.  It does
+# not set or forward any provider output-token parameter.
+TOOL_LOOP_MAX_TOTAL_TOKENS = 64_000
+_MAX_VALIDATION_FEEDBACK_ISSUES = 8
+_VALIDATION_FEEDBACK_FIELDS = frozenset({
+    "action",
+    "target_seat",
+    "save_target",
+    "poison_target",
+    "use_save",
+    "use_poison",
+    "speech",
+    "team_message",
+    "bid",
+    "thought",
+    "claim",
+    "reply_to",
+    "accuses",
+    "private_state",
+    "beliefs",
+    "seat",
+    "wolf_probability",
+    "likely_role",
+    "confidence",
+    "evidence",
+    "candidate_plans",
+    "selected_plan",
+    "public_cover_role",
+    "perceived_image",
+    "deception_plan",
+    "team_plan",
+})
 
 
 class AgentActor:
     """单个 agent 的执行器。
 
     持有 memory + persona + model_config。每次 decide() 产生一个 Decision。
-    所有 decide_* 方法都是真实 LLM 调用。
+    Production decisions have one entry point: ``decide(ActionRequest)``.
     """
 
     def __init__(
@@ -63,6 +110,7 @@ class AgentActor:
         rng: random.Random | None = None,
         is_human: bool = False,
         on_human_request: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        budget_scope: str | None = None,
     ) -> None:
         self.seat = seat
         self.name = name
@@ -71,13 +119,25 @@ class AgentActor:
         self.router = router
         self.is_human = is_human
         self.on_human_request = on_human_request
+        self.budget_scope = budget_scope
         self.memory = AgentMemory(seat=seat, role=role.value)
+        self.private_state = PrivateAgentState(owner_seat=seat, owner_role=role.value)
         self.rng = rng or random.Random(seat * 104729)
         persona_name, persona_desc = assign_persona(seat, self.rng)
         self.persona_name = persona_name
         self.persona_desc = persona_desc
+        # A session is created per ActionRequest; memory/private_state remain
+        # seat-owned across turns, while tool history and terminal state never
+        # leak into the next environment request.
+        self.agent_session: AgentSession | None = None
+        self.on_agent_trace: Callable[[dict[str, Any]], Any] | None = None
+        # A seat owns one mutable memory/private-state/RNG tuple.  Serialize
+        # the complete decision lifecycle so overlapping protocol requests
+        # cannot interleave model turns or replace ``agent_session`` midway.
+        self._decide_lock = asyncio.Lock()
         # 人类玩家操作队列(人机混合模式)
         self.human_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.current_human_request: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # 记忆维护(编排器在状态推进时调用)
@@ -88,379 +148,678 @@ class AgentActor:
     def record_claim(self, seat: int, day: int, claim: dict[str, Any]) -> None:
         self.memory.record_claim(seat, day, claim)
 
-    def apply_suspicion(self, suspicion: dict[int, float]) -> None:
-        self.memory.update_trust(suspicion)
+    def record_public_commitment(
+        self,
+        *,
+        day: int,
+        phase: str,
+        kind: str,
+        text: str,
+        claim: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist exact public output after the environment accepted it."""
+        self.private_state.record_public_commitment(
+            day=day,
+            phase=phase,
+            kind=kind,
+            text=text,
+            claim=claim,
+        )
 
-    def set_trust(self, seat: int, value: float) -> None:
-        self.memory.set_trust(seat, value)
+    def context_provenance(self) -> dict[str, Any]:
+        """Return non-secret digests for the exact seat-owned prompt context."""
+        return {
+            "context_version": "werewolf.agent-context.v1",
+            "memory_digest": self.memory.digest(),
+            "memory_observation_count": self.memory.snapshot()["observation_count"],
+            "private_state_digest": self.private_state.digest(),
+            "private_state_revision": self.private_state.snapshot()["revision"],
+        }
 
     # ------------------------------------------------------------------
     # 人类玩家操作(人机混合)
     # ------------------------------------------------------------------
-    async def _wait_human_action(
-        self,
-        action_type: str,
-        context: dict[str, Any],
-        *,
-        state: GameState,
-        timeout: float | None = None,
-    ) -> Decision:
-        """向人类玩家请求操作并在队列等待结果。
-
-        超时后返回透明 SKIP,承 no-fallback-design(不伪造决策)。
-        """
-        from ..config import HUMAN_TIMEOUT
-
-        timeout = timeout or HUMAN_TIMEOUT
-        request_payload = {
-            "type": "human_action_request",
-            "seat": self.seat,
-            "action_type": action_type,
-            "context": context,
-            "timeout": timeout,
-        }
-        if self.on_human_request:
-            try:
-                await self.on_human_request(request_payload)
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            data = await asyncio.wait_for(self.human_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return Decision(
-                action=AgentAction.SKIP,
-                skip_reason="human_timeout",
-                reasoning=f"人类玩家{self.seat}号在{timeout}秒内未操作,自动跳过。",
-            )
-        return self._parse_human_action(data, action_type, state)
-
-    def _parse_human_action(self, data: dict[str, Any], action_type: str, state: GameState) -> Decision:
-        """把前端 human_action 消息解析为 Decision,并将 target_seat 转为 player_id。"""
+    def enqueue_human_action(self, data: dict[str, Any]) -> tuple[bool, str]:
+        """Validate and enqueue a frontend human action for the current request only."""
         if not isinstance(data, dict):
-            return Decision(action=AgentAction.SKIP, skip_reason="human_action_invalid")
+            return False, "invalid_payload"
+        current = self.current_human_request
+        if not current:
+            return False, "no_pending_request"
+        ok, reason = self._validate_human_action(data, current)
+        if not ok:
+            return False, reason
+        self.human_queue.put_nowait(data)
+        return True, "queued"
 
-        user_action = str(data.get("action", "")).lower()
-        target_seat = data.get("target_seat")
-        speech = data.get("speech")
-        bid = data.get("bid")
-
-        if user_action == "skip":
-            return Decision(action=AgentAction.SKIP, skip_reason="human_skip")
-
-        action_map = {
-            "night_kill": AgentAction.NIGHT_KILL,
-            "kill": AgentAction.NIGHT_KILL,
-            "hunter_shot": AgentAction.NIGHT_KILL,
-            "see": AgentAction.SEE,
-            "save": AgentAction.SAVE,
-            "poison": AgentAction.POISON,
-            "guard": AgentAction.GUARD,
-            "speak": AgentAction.SPEAK,
-            "vote": AgentAction.VOTE,
-            "last_words": AgentAction.LAST_WORDS,
-        }
-        mapped = action_map.get(user_action)
-        if mapped is None:
-            # 如果没传 action,按请求类型推断
-            mapped = action_map.get(action_type)
-        if mapped is None:
-            return Decision(action=AgentAction.SKIP, skip_reason="human_action_unknown")
-
-        target_id = None
-        if target_seat is not None:
+    def _clear_human_queue(self) -> None:
+        while True:
             try:
-                seat = int(float(str(target_seat).replace("号", "").strip()))
-            except (ValueError, TypeError):
-                return Decision(action=AgentAction.SKIP, skip_reason="human_action_invalid_target")
-            for player in state.players:
-                if player.seat == seat and player.alive:
-                    target_id = player.id
-                    break
+                self.human_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-        return Decision(
-            action=mapped,
-            target_id=target_id,
-            speech=str(speech) if speech is not None else None,
-            bid=int(bid) if bid is not None else None,
-            reasoning="人类玩家操作",
-        )
+    def _matches_current_human_request(self, data: dict[str, Any], request_id: str) -> bool:
+        current = self.current_human_request
+        if not isinstance(data, dict) or not current:
+            return False
+        ok, _reason = self._validate_human_action(data, current)
+        return ok and str(data.get("request_id") or "") == request_id
+
+    def _validate_human_action(self, data: dict[str, Any], current: dict[str, Any]) -> tuple[bool, str]:
+        if str(data.get("request_id") or "") != str(current.get("request_id") or ""):
+            return False, "request_id_mismatch"
+        if "phase" not in data:
+            return False, "phase_missing"
+        if "day" not in data:
+            return False, "day_missing"
+        action_phase = data.get("phase")
+        if str(action_phase) != str(current.get("phase")):
+            return False, "phase_mismatch"
+        action_day = data.get("day")
+        try:
+            if int(action_day) != int(current.get("day")):
+                return False, "day_mismatch"
+        except (TypeError, ValueError):
+            return False, "day_invalid"
+        user_action = str(data.get("action") or "").strip().lower()
+        if not user_action:
+            return False, "action_missing"
+        if user_action == "skip":
+            if not bool(current.get("can_skip")):
+                return False, "skip_not_allowed"
+            if any(
+                data.get(field) is not None and data.get(field) != ""
+                for field in ("target_seat", "speech", "bid")
+            ):
+                return False, "skip_payload_not_empty"
+            return True, "queued"
+        if user_action and user_action != "skip":
+            accepted_actions = set(str(item) for item in current.get("accepted_actions") or [])
+            if accepted_actions and user_action not in accepted_actions:
+                return False, "action_type_mismatch"
+        if user_action != "skip" and current.get("requires_target") and data.get("target_seat") is None:
+            return False, "target_required"
+        allowed = current.get("allowed_target_seats")
+        if data.get("target_seat") is not None:
+            target_seat = _parse_single_seat(data.get("target_seat"))
+            if target_seat is None:
+                return False, "target_invalid"
+            if allowed is not None and target_seat not in set(int(item) for item in allowed):
+                return False, "target_not_allowed"
+        if user_action in {"speak", "last_words"} and not str(data.get("speech") or "").strip():
+            return False, "speech_required"
+        if user_action == "speak" and data.get("bid") is None:
+            return False, "bid_required"
+        if data.get("bid") is not None:
+            try:
+                bid = int(str(data.get("bid")).strip())
+            except (TypeError, ValueError):
+                return False, "bid_invalid"
+            if bid < 0 or bid > 4:
+                return False, "bid_out_of_range"
+            if user_action == "speak" and bid == 0:
+                return False, "bid_zero_requires_skip"
+        return True, "queued"
 
     # ------------------------------------------------------------------
     # 决策入口
     # ------------------------------------------------------------------
-    async def decide_night_action(
-        self,
-        state: GameState,
-        player_id: str,
-        *,
-        today_speeches: list[dict] | None = None,
-        requested_action: str | None = None,
-        human_context: dict[str, Any] | None = None,
-        max_attempts: int = DECISION_MAX_ATTEMPTS,
-    ) -> Decision:
-        """夜间行动决策。"""
-        if self.is_human:
-            ctx = {
-                "phase": state.phase.value,
-                "day": state.day,
-                "role": self.role.value,
-                "requested_action": requested_action,
-            }
-            if human_context:
-                ctx.update(human_context)
-            return await self._wait_human_action(requested_action or "night_action", ctx, state=state)
-        obs = build_observation(
-            state,
-            player_id,
-            rng=self.rng,
-            available_actions=[requested_action] if requested_action else None,
-        )
-        if today_speeches:
-            attach_today_speeches(obs, today_speeches)
+    async def decide(self, request: ActionRequest) -> DecisionEnvelope:
+        """Serialize decisions for this seat's mutable private state."""
+        async with self._decide_lock:
+            return await self._decide_serial(request)
 
-        extras = self._role_extras()
-        if self.role == Role.WEREWOLF:
-            role_text = role_prompt(self.role.value, teammates=obs.my_teammates, extras=extras)
-        else:
-            role_text = role_prompt(self.role.value, extras=extras)
+    async def _decide_serial(self, request: ActionRequest) -> DecisionEnvelope:
+        """Handle one harness ``ActionRequest`` with one model decision.
 
-        instruction = night_action_instruction(obs, self.role.value, requested_action=requested_action)
-        system, messages, _ = build_messages(
-            persona_name=self.persona_name,
-            persona_desc=self.persona_desc,
-            role_text=role_text,
-            observation_text=render_observation(obs, self.memory.render_for_prompt()),
-            action_instruction=instruction,
-        )
-
-        raw = await self._call_with_retry(messages, system, max_attempts=max_attempts)
-        return self._sanitize_night(raw, obs, requested_action=requested_action)
-
-    async def decide_speak(
-        self,
-        state: GameState,
-        player_id: str,
-        *,
-        today_speeches: list[dict] | None = None,
-        max_attempts: int = DECISION_MAX_ATTEMPTS,
-    ) -> Decision:
-        """白天发言决策(含竞价 bid)。"""
-        if self.is_human:
-            ctx = {"phase": state.phase.value, "day": state.day, "today_speeches": today_speeches or []}
-            return await self._wait_human_action("speak", ctx, state=state)
-        obs = build_observation(state, player_id, rng=self.rng)
-        if today_speeches:
-            attach_today_speeches(obs, today_speeches)
-
-        extras = self._role_extras()
-        if self.role == Role.WEREWOLF:
-            role_text = role_prompt(self.role.value, teammates=obs.my_teammates, extras=extras)
-        else:
-            role_text = role_prompt(self.role.value, extras=extras)
-
-        instruction = speak_instruction(obs)
-        system, messages, _ = build_messages(
-            persona_name=self.persona_name,
-            persona_desc=self.persona_desc,
-            role_text=role_text,
-            observation_text=render_observation(obs, self.memory.render_for_prompt()),
-            action_instruction=instruction,
-        )
-
-        raw = await self._call_with_retry(messages, system, max_attempts=max_attempts)
-        decision = self._sanitize_speak(raw, obs)
-        # 记录公开声称
-        if decision.claim:
-            self.record_claim(self.seat, state.day, decision.claim)
-        return decision
-
-    async def decide_wolf_caucus(
-        self,
-        state: GameState,
-        player_id: str,
-        *,
-        max_attempts: int = DECISION_MAX_ATTEMPTS,
-    ) -> dict[str, Any] | None:
-        """狼队白天党团会议(方向C):白天发言前狼队私聊商定推人目标+口径。
-
-        复用夜间 _werewolf_deliberation 的私聊拓扑(仅狼人可见的信息隔离通道)。
-        返回 {target_seat, strategy, reasoning} 供 orchestrator 聚合共识。
-        这是狼人的"主张",不直接落地——orchestrator 聚合后作为私有观察注入
-        每个狼人记忆,狼人发言时自主决定是否照做(harness 不写发言,守 no-fallback)。
+        The environment has already projected the full game state into the
+        request observation and advertised the legal action space.  The agent
+        never receives ``GameState`` through this boundary.
         """
-        if self.is_human or self.role != Role.WEREWOLF:
-            return None
-        obs = build_observation(state, player_id, rng=self.rng)
-        extras = self._role_extras()
-        role_text = role_prompt(self.role.value, teammates=obs.my_teammates, extras=extras)
-        alive_good = [s for s in obs.alive_seats if s != obs.my_seat
-                      and not any(t.get("seat") == s for t in obs.my_teammates)]
-        instruction = (
-            f"现在是白天发言前的狼队党团会议(仅狼人可见的私聊,好人听不到)。\n"
-            f"你是{obs.my_seat}号(狼人),队友:{[t.get('seat') for t in obs.my_teammates]}。\n"
-            f"存活好人座位:{alive_good or '(无,已胜)'}\n"
-            f"请和队友商定今天白天统一推谁出局(target_seat),以及统一口径(strategy,如'集体指控他行为异常'/'分散别跟太紧避免暴露抱团')。\n"
-            f"返回 JSON:\n"
-            f'{{"thought":"你的党团会议发言(私聊,写清为什么推这个目标/怎么配合,越细越好)",'
-            f'"target_seat":目标座位号(int,填一个好人),'
-            f'"strategy":"统一口径(一句话,供队友白天各自执行)"}}'
-        )
-        system, messages, _ = build_messages(
-            persona_name=self.persona_name,
-            persona_desc=self.persona_desc,
-            role_text=role_text,
-            observation_text=render_observation(obs, self.memory.render_for_prompt()),
-            action_instruction=instruction,
-        )
-        raw = await self._call_with_retry(messages, system, max_attempts=max_attempts)
-        target_seat = self._extract_int(raw, "target_seat")
-        strategy = self._extract_str(raw, "strategy") or ""
-        reasoning = self._extract_str(raw, "thought") or ""
-        # 过滤非法目标(必须是活的好人,不能是自己/队友)
-        valid = set(alive_good)
-        if target_seat not in valid:
-            target_seat = None
-        if not target_seat and not strategy:
-            return None
-        return {"target_seat": target_seat, "strategy": strategy, "reasoning": reasoning}
-
-    async def decide_vote(
-        self,
-        state: GameState,
-        player_id: str,
-        *,
-        today_speeches: list[dict] | None = None,
-        pk_candidates: list[str] | None = None,
-        max_attempts: int = DECISION_MAX_ATTEMPTS,
-    ) -> Decision:
-        """投票决策。PK 时 pk_candidates(player_id 列表)限制投票目标(且不可投自己)。"""
+        if request.seat != self.seat:
+            err = AgentDecisionError(
+                f"request seat {request.seat} does not match agent seat {self.seat}"
+            )
+            setattr(err, "error_type", "AgentRequestSeatMismatch")
+            setattr(err, "request_id", request.request_id)
+            raise err
+        supported_actions = {
+            "speak",
+            "vote",
+            "last_words",
+            "wolf_council",
+            "night_kill",
+            "kill",
+            "see",
+            "save",
+            "poison",
+            "guard",
+            "hunter_shot",
+        }
+        if request.action_kind not in supported_actions:
+            err = AgentDecisionError(
+                f"unsupported ActionRequest action_kind: {request.action_kind!r}"
+            )
+            setattr(err, "error_type", "UnsupportedActionRequest")
+            setattr(err, "request_id", request.request_id)
+            raise err
+        obs = AgentObservation(**request.observation)
+        if obs.my_seat != self.seat:
+            err = AgentDecisionError(
+                f"observation seat {obs.my_seat} does not match agent seat {self.seat}"
+            )
+            setattr(err, "error_type", "AgentObservationSeatMismatch")
+            setattr(err, "request_id", request.request_id)
+            raise err
+        if obs.my_role != self.role.value:
+            err = AgentDecisionError(
+                f"observation role {obs.my_role!r} does not match agent role {self.role.value!r}"
+            )
+            setattr(err, "error_type", "AgentObservationRoleMismatch")
+            setattr(err, "request_id", request.request_id)
+            raise err
+        started = time.monotonic()
         if self.is_human:
-            ctx = {"phase": state.phase.value, "day": state.day, "today_speeches": today_speeches or [],
-                   "pk_candidates": pk_candidates}
-            return await self._wait_human_action("vote", ctx, state=state)
-        # PK 候选:从 player_id 列表转成座位列表
-        pk_seats: list[int] | None = None
-        if pk_candidates:
-            pk_seats = [state.get_player(pid).seat for pid in pk_candidates]
-        obs = build_observation(state, player_id, rng=self.rng, vote_targets=pk_seats, in_pk=bool(pk_seats))
-        if today_speeches:
-            attach_today_speeches(obs, today_speeches)
+            decision = await self._decide_human_request(request, obs)
+            return DecisionEnvelope(
+                request_id=request.request_id,
+                seat=self.seat,
+                decision=decision,
+                latency_seconds=round(time.monotonic() - started, 6),
+                parse_status="not_applicable",
+                metadata={"agent_kind": "human"},
+            )
 
-        extras = self._role_extras()
-        if self.role == Role.WEREWOLF:
-            role_text = role_prompt(self.role.value, teammates=obs.my_teammates, extras=extras)
-        else:
-            role_text = role_prompt(self.role.value, extras=extras)
+        # Production routers expose a provider-neutral tool turn.  Narrow
+        # complete_json-only test doubles keep the legacy adapter below so old
+        # protocol tests can isolate response parsing without pretending to be
+        # a tool-capable Agent harness.
+        if callable(getattr(self.router, "complete_tools", None)):
+            return await self._decide_with_tool_loop(
+                request,
+                obs,
+                started=started,
+            )
 
-        instruction = vote_instruction(obs)
-        system, messages, _ = build_messages(
-            persona_name=self.persona_name,
-            persona_desc=self.persona_desc,
-            role_text=role_text,
-            observation_text=render_observation(obs, self.memory.render_for_prompt()),
-            action_instruction=instruction,
-        )
-
-        raw = await self._call_with_retry(messages, system, max_attempts=max_attempts)
-        return self._sanitize_vote(raw, obs)
-
-    async def decide_last_words(
-        self,
-        state: GameState,
-        player_id: str,
-        reason: str,
-        *,
-        max_attempts: int = DECISION_MAX_ATTEMPTS,
-    ) -> Decision:
-        """遗言。"""
-        if self.is_human:
-            return await self._wait_human_action("last_words", {"reason": reason, "day": state.day}, state=state)
-        obs = build_observation(state, player_id, rng=self.rng)
-        extras = self._role_extras()
         role_text = role_prompt(
             self.role.value,
             teammates=obs.my_teammates if self.role == Role.WEREWOLF else None,
-            extras=extras,
+            extras=self._role_extras(),
         )
-        instruction = last_words_instruction(reason)
+        action = request.action_kind
+        if action == "wolf_council":
+            instruction = wolf_council_instruction(obs)
+            required: list[str | tuple[str, ...]] = ["team_message", "target_seat"]
+        elif action == "speak":
+            instruction = speak_instruction(obs)
+            required = ["speech?", "bid"]
+        elif action == "vote":
+            instruction = vote_instruction(obs)
+            required = ["target_seat"]
+        elif action == "last_words":
+            instruction = last_words_instruction(str(request.private_context.get("reason") or ""))
+            required = ["speech?"]
+        else:
+            instruction = night_action_instruction(obs, self.role.value, requested_action=action)
+            required = self._required_night_fields(action)
+        required.append("private_state")
+
         system, messages, _ = build_messages(
             persona_name=self.persona_name,
             persona_desc=self.persona_desc,
             role_text=role_text,
-            observation_text=render_observation(obs, self.memory.render_for_prompt()),
+            observation_text=render_observation(
+                obs,
+                self.memory.render_for_prompt(),
+                self.private_state.render_for_prompt(),
+            ),
             action_instruction=instruction,
         )
-        raw = await self._call_with_retry(messages, system, max_attempts=max_attempts)
-        return self._sanitize_last_words(raw)
+        raw = await self._call_with_retry(
+            messages,
+            system,
+            max_attempts=DECISION_MAX_ATTEMPTS,
+            required_fields=required,
+            trace_context={
+                "request_id": request.request_id,
+                "run_id": request.run_id,
+                "budget_scope": self.budget_scope,
+                "seat": self.seat,
+                "role": self.role.value,
+                "day": request.day,
+                "phase": request.phase,
+                "action": action,
+            },
+        )
+        self.private_state.apply_model_update(
+            raw["private_state"],
+            visible_seats={int(item["seat"]) for item in obs.seats},
+            day=request.day,
+            phase=request.phase,
+            known_wolf_seats={
+                int(item["seat"])
+                for item in obs.my_teammates
+                if item.get("seat") is not None
+            } | _private_checked_seats(obs, wolf=True),
+            known_village_seats=_private_checked_seats(obs, wolf=False),
+            total_wolves=int(obs.role_counts.get(Role.WEREWOLF.value, 0)),
+        )
+        if action == "wolf_council":
+            decision = self._sanitize_wolf_council(raw)
+        elif action == "speak":
+            decision = self._sanitize_speak(raw, obs)
+        elif action == "vote":
+            decision = self._sanitize_vote(raw)
+        elif action == "last_words":
+            decision = self._sanitize_last_words(raw)
+        else:
+            decision = self._sanitize_night(raw, requested_action=action)
+        self._attach_llm_trace(decision, raw)
+        trace = raw.get("_llm_call_trace") if isinstance(raw.get("_llm_call_trace"), dict) else {}
+        return DecisionEnvelope(
+            request_id=request.request_id,
+            seat=self.seat,
+            decision=decision,
+            latency_seconds=round(time.monotonic() - started, 6),
+            model_call_id=trace.get("call_id"),
+            prompt_hash=trace.get("request_hash"),
+            response_hash=trace.get("response_hash"),
+            parse_status="recovered" if raw.get("_parse_recovered") else "ok",
+            metadata={
+                "agent_kind": "llm",
+                "provider": self.model_config.provider,
+                "model": self.model_config.model,
+            },
+        )
 
-    async def reflect(
+    async def _decide_human_request(
         self,
-        state: GameState,
-        player_id: str,
+        request: ActionRequest,
+        obs: AgentObservation,
+    ) -> Decision:
+        """Wait for a human response using the same request/envelope boundary."""
+        from ..config import HUMAN_TIMEOUT
+
+        remaining = request.seconds_remaining()
+        timeout = float(HUMAN_TIMEOUT if remaining is None else remaining)
+        self._clear_human_queue()
+        legal = request.legal_actions[0] if request.legal_actions else None
+        allowed_targets = list(legal.target_seats) if legal else []
+        requires_target = bool(legal.requires_target) if legal else False
+        context = {
+            **request.private_context,
+            "day": request.day,
+            "phase": request.phase,
+            "requested_action": request.action_kind,
+            "allowed_target_seats": allowed_targets,
+            "requires_target": requires_target,
+            "can_skip": bool(legal.can_skip) if legal else False,
+            "timeout": timeout,
+            "timeout_ms": int(timeout * 1000),
+        }
+        payload = {
+            "type": "human_action_request",
+            "request_id": request.request_id,
+            "seat": self.seat,
+            "action_type": request.action_kind,
+            "context": context,
+            "timeout": timeout,
+            "day": request.day,
+            "phase": request.phase,
+        }
+        self.current_human_request = {
+            "request_id": request.request_id,
+            "action_type": request.action_kind,
+            "accepted_actions": [request.action_kind],
+            "requires_target": requires_target,
+            "can_skip": bool(legal.can_skip) if legal else False,
+            "day": request.day,
+            "phase": request.phase,
+            "allowed_target_seats": allowed_targets,
+        }
+        if self.on_human_request:
+            await self.on_human_request(payload)
+        try:
+            if request.metadata.get("deadline_owner") == "decision_runtime":
+                data = await self.human_queue.get()
+            else:
+                data = await asyncio.wait_for(self.human_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await self.on_decision_timeout(request)
+            raise _human_timeout_error(request, timeout)
+        finally:
+            self.current_human_request = None
+
+        action = str(data.get("action") or request.action_kind)
+        if action == "skip":
+            return Decision(action=AgentAction.SKIP, skip_reason="human_skip")
+        target_seat = _parse_single_seat(data.get("target_seat"))
+        mapped = {
+            "night_kill": AgentAction.NIGHT_KILL,
+            "kill": AgentAction.NIGHT_KILL,
+            "see": AgentAction.SEE,
+            "save": AgentAction.SAVE,
+            "poison": AgentAction.POISON,
+            "guard": AgentAction.GUARD,
+            "hunter_shot": AgentAction.NIGHT_KILL,
+            "speak": AgentAction.SPEAK,
+            "vote": AgentAction.VOTE,
+            "last_words": AgentAction.LAST_WORDS,
+        }.get(action)
+        if mapped is None:
+            err = AgentDecisionError(f"human response action is unknown: {action!r}")
+            setattr(err, "error_type", "HumanResponseInvalid")
+            raise err
+        raw_speech = str(data.get("speech") or "")
+        speech = raw_speech if raw_speech.strip() else None
+        if action in {"speak", "last_words"} and speech is None:
+            err = AgentDecisionError("human text action requires non-empty speech")
+            setattr(err, "error_type", "HumanResponseInvalid")
+            raise err
+        return Decision(
+            action=mapped,
+            target_seat=target_seat,
+            speech=speech,
+            bid=int(data["bid"]) if action == "speak" else None,
+        )
+
+    async def _decide_with_tool_loop(
+        self,
+        request: ActionRequest,
+        obs: AgentObservation,
         *,
-        max_attempts: int = REFLECTION_MAX_ATTEMPTS,
-    ) -> str | None:
-        """轮末反思(异步,不阻塞游戏推进)。失败返回 None,不致命。"""
-        obs = build_observation(state, player_id, rng=self.rng)
-        instruction = reflection_instruction(state.phase, state.day)
-        system, messages, _ = build_messages(
+        started: float,
+    ) -> DecisionEnvelope:
+        """Run one bounded, seat-private model/tool loop.
+
+        A terminal tool only creates a ``Decision``.  The shared
+        ``DecisionRuntime`` and Werewolf rules remain the sole consumers of
+        that decision, so a model cannot mutate the environment from a tool
+        handler or silently turn a failed turn into SKIP.
+        """
+        action = str(request.action_kind)
+        role_text = role_prompt(
+            self.role.value,
+            teammates=obs.my_teammates if self.role == Role.WEREWOLF else None,
+            extras=self._role_extras(),
+        )
+        visible_seats = sorted({
+            parsed
+            for item in obs.seats
+            if isinstance(item, dict)
+            if (parsed := _parse_single_seat(item.get("seat"))) is not None
+        })
+        visible_seat_set = set(visible_seats)
+        alive_seats = sorted({
+            parsed
+            for item in obs.alive_seats
+            if (parsed := _parse_single_seat(item)) in visible_seat_set
+        })
+        system, initial_messages = build_tool_loop_turn(
+            seat=self.seat,
+            visible_seats=visible_seats,
+            alive_seats=alive_seats,
             persona_name=self.persona_name,
             persona_desc=self.persona_desc,
-            role_text=role_prompt(self.role.value, extras=self._role_extras()),
-            observation_text=render_observation(obs, self.memory.render_for_prompt()),
-            action_instruction=instruction,
+            role_text=role_text,
+            phase=request.phase,
+            day=request.day,
+            action=action,
+            request_id=request.request_id,
         )
+        registry = build_werewolf_tool_registry(self, request, obs)
+        session = AgentSession(
+            seat=self.seat,
+            role=self.role.value,
+            session_id=f"{request.request_id}:agent-session",
+            registry=registry,
+            limits=AgentSessionLimits(
+                max_steps=TOOL_LOOP_MAX_STEPS,
+                max_model_generations=TOOL_LOOP_MAX_GENERATIONS,
+                max_tool_calls=TOOL_LOOP_MAX_TOOL_CALLS,
+                max_no_progress_steps=TOOL_LOOP_MAX_NO_PROGRESS,
+                max_total_tokens=TOOL_LOOP_MAX_TOTAL_TOKENS,
+                max_wall_time_seconds=None,
+            ),
+            private_state=self.private_state,
+            memory=self.memory,
+            trace_sink=self.on_agent_trace,
+        )
+        self.agent_session = session
+        trace_context = {
+            "request_id": request.request_id,
+            "run_id": request.run_id,
+            "actor_id": f"seat:{self.seat}",
+            "seat": self.seat,
+            "role": self.role.value,
+            "day": request.day,
+            "phase": request.phase,
+            "action": action,
+            "stage": "agent_tool_loop",
+            "budget_scope": self.budget_scope,
+        }
         try:
-            raw = await self._call_with_retry(messages, system, max_attempts=max_attempts)
-        except AgentDecisionError:
-            return None
-        insight = self._extract_str(raw, "insight") or ""
-        suspicion = parse_suspicion(raw.get("suspicion"), obs.alive_seats, self.seat)
-        if insight:
-            self.memory.reflect(state.day, state.phase, insight)
-        if suspicion:
-            self.apply_suspicion(suspicion)
-        return insight or None
+            result = await session.run(
+                request,
+                router=self.router,
+                config=self.model_config,
+                system=system,
+                initial_messages=initial_messages,
+                trace_context=trace_context,
+                budget_scope=self.budget_scope,
+            )
+        except (asyncio.CancelledError, Exception):
+            # Reclaim any external handler task before the per-seat lock is
+            # released.  A task that ignores cancellation remains a bounded,
+            # attributable failure rather than continuing with seat state.
+            try:
+                await session.aclose()
+            except Exception:
+                logger.exception("agent tool cleanup failed (seat=%s request=%s)", self.seat, request.request_id)
+            raise
+        try:
+            await session.aclose()
+        except AgentSessionError as cleanup_error:
+            failure = AgentDecisionError(
+                f"agent {self.seat}({self.role.value}) tool cleanup failed"
+            )
+            setattr(failure, "error_type", "AgentToolCleanupFailure")
+            setattr(failure, "agent_session_error", cleanup_error.code)
+            setattr(failure, "request_id", request.request_id)
+            raise failure from cleanup_error
+        attempts = _tool_loop_response_attempts(result, request)
+        session_summary = result.public_summary()
+        if result.error is not None or result.decision is None:
+            failure = AgentDecisionError(
+                f"agent {self.seat}({self.role.value}) tool loop failed: "
+                f"{result.error.code if result.error else 'terminal_decision_missing'}"
+            )
+            setattr(failure, "error_type", "AgentToolLoopFailure")
+            setattr(failure, "agent_session_error", result.error.code if result.error else "terminal_decision_missing")
+            setattr(failure, "agent_session_telemetry", session_summary)
+            setattr(failure, "llm_call_attempts", attempts)
+            setattr(failure, "request_id", request.request_id)
+            raise failure from (result.error.cause if result.error is not None else None)
+
+        decision = result.require_decision()
+        final_trace = attempts[-1].get("llm_call") if attempts else None
+        if not isinstance(final_trace, dict):
+            final_trace = {
+                "call_id": None,
+                "context": {"request_id": request.request_id},
+                "usage": {},
+                "latency": 0.0,
+                "finish_reason": None,
+            }
+        else:
+            final_trace = dict(final_trace)
+        final_trace["actor_response_attempt_count"] = len(attempts)
+        final_trace["actor_response_attempts"] = [dict(row) for row in attempts]
+        final_trace["agent_session"] = session_summary
+        private_reasoning = "\n".join(
+            str(row.get("reasoning") or "").strip()
+            for row in session.private_trace
+            if row.get("type") == "model_generation" and str(row.get("reasoning") or "").strip()
+        ).strip()
+        if private_reasoning:
+            decision = decision.model_copy(update={"reasoning": private_reasoning[:4000]})
+        setattr(decision, "llm_call_trace", final_trace)
+        final_call_id = final_trace.get("call_id")
+        return DecisionEnvelope(
+            request_id=request.request_id,
+            seat=self.seat,
+            decision=decision,
+            latency_seconds=round(time.monotonic() - started, 6),
+            model_call_id=final_call_id,
+            prompt_hash=final_trace.get("request_hash"),
+            response_hash=final_trace.get("response_hash"),
+            parse_status="not_applicable",
+            metadata={
+                "agent_kind": "llm",
+                "runtime": "tool_loop",
+                "provider": self.model_config.provider,
+                "model": self.model_config.model,
+                "agent_session": session_summary,
+            },
+        )
+
+    async def on_decision_timeout(self, request: ActionRequest) -> None:
+        """Emit human-input expiry when DecisionRuntime owns the deadline."""
+        if not self.is_human or not self.on_human_request:
+            return
+        await self.on_human_request({
+            "type": "human_action_expired",
+            "request_id": request.request_id,
+            "seat": self.seat,
+            "action_type": request.action_kind,
+            "reason": "human_timeout",
+            "day": request.day,
+            "phase": request.phase,
+        })
 
     # ------------------------------------------------------------------
     # LLM 调用 + 重试
     # ------------------------------------------------------------------
-    async def _call_with_retry(self, messages: list[dict], system: str, *, max_attempts: int) -> dict[str, Any]:
-        """真实 LLM 调用,解析失败重试(承 no-fallback-design)。
+    async def _call_with_retry(
+        self,
+        messages: list[dict],
+        system: str,
+        *,
+        max_attempts: int,
+        required_fields: list[str | tuple[str, ...]] | None = None,
+        trace_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """真实 LLM 调用；只为响应级错误重新请求模型。
 
-        - LLMError(网络/网关)由 router 内部已重试,这里捕获后继续重试(深度重试)。
-        - 解析失败(JSON 拿到但字段缺失)在这里重试 max_attempts 次。
+        - 网络/网关故障由 Router 在一次调用内重试，Actor 不叠加请求。
+        - JSON 不完整、字段缺失或 schema 不合格时最多重新请求 max_attempts 次。
         - 彻底失败抛 AgentDecisionError,绝不返回伪造 dict。
         """
         last_err: Exception | None = None
         attempts = max(1, max_attempts)
+        response_attempts: list[dict[str, Any]] = []
+        retry_feedback: str | None = None
         for attempt in range(attempts):
+            raw: dict[str, Any] | None = None
+            attempt_messages = [dict(message) for message in messages]
+            if retry_feedback:
+                attempt_messages.append({"role": "user", "content": retry_feedback})
             try:
-                allow_lossy = attempt == attempts - 1
-                raw = await self.router.complete_json(
-                    messages,
-                    self.model_config,
-                    system=system,
-                    allow_lossy=allow_lossy,
-                    include_parse_metadata=allow_lossy,
-                )
+                try:
+                    raw = await self.router.complete_json(
+                        attempt_messages,
+                        self.model_config,
+                        system=system,
+                        allow_lossy=False,
+                        include_parse_metadata=True,
+                        trace_context=trace_context,
+                    )
+                except TypeError as err:
+                    if trace_context is None or "trace_context" not in str(err):
+                        raise
+                    raw = await self.router.complete_json(
+                        attempt_messages,
+                        self.model_config,
+                        system=system,
+                        allow_lossy=False,
+                        include_parse_metadata=True,
+                    )
                 if not isinstance(raw, dict):
                     raise ValueError(f"LLM 返回非对象: {type(raw)}")
+                self._ensure_required_fields(raw, required_fields)
                 if raw.get("_parse_lossy"):
-                    logger.warning(
-                        "agent %s(%s) 使用有损 JSON 恢复结果 attempt=%d/%d method=%s",
-                        self.seat,
-                        self.role.value,
-                        attempt + 1,
-                        attempts,
-                        raw.get("_parse_method"),
-                    )
+                    raise ValueError(f"LLM JSON 有损恢复结果不可落地: {raw.get('_parse_method')}")
+                call_trace = raw.get("_llm_call_trace")
+                response_attempts.append(_actor_response_attempt(
+                    attempt=attempt + 1,
+                    status="accepted",
+                    call_trace=call_trace if isinstance(call_trace, dict) else None,
+                ))
+                if isinstance(call_trace, dict):
+                    augmented_trace = dict(call_trace)
+                    augmented_trace["actor_response_attempt_count"] = len(response_attempts)
+                    augmented_trace["actor_response_attempts"] = [
+                        dict(row) for row in response_attempts
+                    ]
+                    raw["_llm_call_trace"] = augmented_trace
                 return raw
-            except LLMError as err:
+            except LLMResponseError as err:
                 last_err = err
+                retry_feedback = None
+                response_attempts.append(_actor_response_attempt(
+                    attempt=attempt + 1,
+                    status="response_rejected",
+                    error=err,
+                    call_trace=_error_or_raw_call_trace(err, raw),
+                ))
                 logger.warning(
-                    "agent %s(%s) LLM调用失败 attempt=%d/%d: %s",
-                    self.seat, self.role.value, attempt + 1, attempts, err,
+                    "agent %s(%s) 模型响应不合格 attempt=%d/%d error_type=%s",
+                    self.seat, self.role.value, attempt + 1, attempts, type(err).__name__,
+                )
+                if attempt < attempts - 1:
+                    await self._sleep_before_retry(attempt)
+                    continue
+                break
+            except LLMError as err:
+                # Router has already exhausted its transport/provider retry
+                # budget. Reissuing the whole actor request here would
+                # multiply real API traffic without improving provenance.
+                last_err = err
+                response_attempts.append(_actor_response_attempt(
+                    attempt=attempt + 1,
+                    status="provider_failed",
+                    error=err,
+                    call_trace=_error_or_raw_call_trace(err, raw),
+                ))
+                logger.warning(
+                    "agent %s(%s) LLM调用失败(Router已重试) error_type=%s",
+                    self.seat, self.role.value, type(err).__name__,
+                )
+                break
+            except ValidationError as err:
+                retry_feedback = _validation_retry_feedback(err)
+                last_err = ValueError(_validation_failure_summary(err))
+                response_attempts.append(_actor_response_attempt(
+                    attempt=attempt + 1,
+                    status="response_rejected",
+                    error=err,
+                    call_trace=_error_or_raw_call_trace(err, raw),
+                ))
+                logger.warning(
+                    "agent %s(%s) schema校验失败 attempt=%d/%d issue_count=%d",
+                    self.seat,
+                    self.role.value,
+                    attempt + 1,
+                    attempts,
+                    min(
+                        len(err.errors(
+                            include_url=False,
+                            include_context=False,
+                            include_input=False,
+                        )),
+                        _MAX_VALIDATION_FEEDBACK_ISSUES,
+                    ),
                 )
                 if attempt < attempts - 1:
                     await self._sleep_before_retry(attempt)
@@ -468,17 +827,80 @@ class AgentActor:
                 break
             except (ValueError, KeyError, TypeError) as err:
                 last_err = err
+                retry_feedback = None
+                response_attempts.append(_actor_response_attempt(
+                    attempt=attempt + 1,
+                    status="response_rejected",
+                    error=err,
+                    call_trace=_error_or_raw_call_trace(err, raw),
+                ))
                 logger.warning(
-                    "agent %s(%s) 解析失败 attempt=%d/%d: %s",
-                    self.seat, self.role.value, attempt + 1, attempts, err,
+                    "agent %s(%s) 解析失败 attempt=%d/%d error_type=%s",
+                    self.seat, self.role.value, attempt + 1, attempts, type(err).__name__,
                 )
                 if attempt < attempts - 1:
                     await self._sleep_before_retry(attempt)
                     continue
                 break
-        raise AgentDecisionError(
-            f"agent {self.seat}({self.role.value}) 决策彻底失败({max_attempts}次重试): {last_err}"
+        failure = AgentDecisionError(
+            f"agent {self.seat}({self.role.value}) 决策失败(最多{max_attempts}次响应尝试): {last_err}"
         )
+        setattr(failure, "llm_call_attempts", [dict(row) for row in response_attempts])
+        raise failure
+
+    @staticmethod
+    def _ensure_required_fields(raw: dict[str, Any], required_fields: list[str | tuple[str, ...]] | None) -> None:
+        """Validate action-critical JSON fields before a Decision can be consumed."""
+        for field in required_fields or []:
+            if isinstance(field, tuple):
+                present = [candidate for candidate in field if AgentActor._has_required_field(raw, candidate)]
+                if not present:
+                    joined = "|".join(field)
+                    raise ValueError(f"LLM JSON 缺少必需字段组: {joined}")
+                for candidate in present:
+                    AgentActor._validate_required_value(raw, candidate)
+                continue
+            if not AgentActor._has_required_field(raw, field):
+                raise ValueError(f"LLM JSON 缺少必需字段: {field}")
+            AgentActor._validate_required_value(raw, field)
+
+    @staticmethod
+    def _validate_required_value(raw: dict[str, Any], field: str) -> None:
+        field_name = field[:-1] if field.endswith("?") else field
+        value = raw.get(field_name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return
+        if field_name == "bid":
+            bid = AgentActor._extract_int(raw, "bid")
+            if bid is None or bid < 0 or bid > 4:
+                raise ValueError(f"LLM JSON bid 超出合法范围 0..4: {value!r}")
+        if field_name in {"target_seat", "save_target", "poison_target"}:
+            if AgentActor._extract_int(raw, field_name) is None:
+                raise ValueError(f"LLM JSON {field_name} 不是整数座位: {value!r}")
+        if field_name in {"speech", "team_message"} and not str(value).strip():
+            raise ValueError(f"LLM JSON {field_name} 必须是非空文本")
+        if field_name == "private_state":
+            PrivateAgentState.validate_model_update(value)
+
+    @staticmethod
+    def _has_required_field(raw: dict[str, Any], field: str) -> bool:
+        allow_none = field.endswith("?")
+        field_name = field[:-1] if allow_none else field
+        if field_name not in raw:
+            return False
+        value = raw.get(field_name)
+        if value is None:
+            return allow_none
+        if isinstance(value, str) and not value.strip():
+            return allow_none
+        return True
+
+    @staticmethod
+    def _attach_llm_trace(decision: Decision, raw: dict[str, Any]) -> Decision:
+        trace = raw.get("_llm_call_trace")
+        if isinstance(trace, dict):
+            setattr(decision, "llm_call_trace", trace)
+        return decision
 
     async def _sleep_before_retry(self, attempt: int) -> None:
         delay = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
@@ -486,54 +908,49 @@ class AgentActor:
         await asyncio.sleep(delay + jitter)
 
     # ------------------------------------------------------------------
-    # 清洗校验(承 no-fallback-design:就近修正或合法 SKIP,非伪造)
+    # Response normalization. Optional explicit non-action becomes SKIP;
+    # malformed or illegal intent is preserved for protocol rejection. The
+    # environment never invents a replacement target or action.
     # ------------------------------------------------------------------
-    def _sanitize_night(self, raw: dict, obs, *, requested_action: str | None = None) -> Decision:
+    def _sanitize_night(self, raw: dict, *, requested_action: str | None = None) -> Decision:
         thought = self._extract_str(raw, "thought") or ""
-        parse_failed = self._parse_lossy(raw)
-        suspicion = parse_suspicion(raw.get("suspicion"), obs.alive_seats, self.seat)
-        if suspicion:
-            self.apply_suspicion(suspicion)
-
         target_seat = self._extract_int(raw, "target_seat")
-        # 女巫特殊处理
-        if self.role == Role.WITCH:
-            return self._sanitize_witch(raw, obs, thought, suspicion, requested_action=requested_action)
-
         action = self._night_action_for_request(requested_action)
         if action is None:
-            action_map = {
-                Role.WEREWOLF: AgentAction.NIGHT_KILL,
-                Role.SEER: AgentAction.SEE,
-                Role.GUARD: AgentAction.GUARD,
-                Role.DOCTOR: AgentAction.SAVE,
-            }
-            action = action_map.get(self.role, AgentAction.SKIP)
+            err = AgentDecisionError(
+                f"unsupported ActionRequest action_kind: {requested_action!r}"
+            )
+            setattr(err, "error_type", "UnsupportedActionRequest")
+            raise err
 
-        target_id = self._resolve_target(target_seat, obs)
-        if action != AgentAction.SKIP and target_id is None:
-            # 目标非法:真实意图无法落地,落入合法不行动(透明标记)
+        # 女巫 save/poison 响应有兼容两种目标字段的结构化适配。
+        if self.role == Role.WITCH and requested_action in {"save", "poison"}:
+            return self._sanitize_witch(raw, thought, requested_action=requested_action)
+        if target_seat is None and requested_action in {"save", "hunter_shot"}:
             return Decision(
                 action=AgentAction.SKIP,
                 reasoning=thought,
-                suspicion=suspicion if suspicion else None,
-                skip_reason="night_target_unresolved",
-                parse_failed=parse_failed,
+                skip_reason=f"{requested_action}_declined",
             )
         return Decision(
             action=action,
-            target_id=target_id,
+            target_seat=target_seat,
             reasoning=thought,
-            suspicion=suspicion if suspicion else None,
-            parse_failed=parse_failed,
+        )
+
+    def _sanitize_wolf_council(self, raw: dict[str, Any]) -> Decision:
+        """Preserve one wolf's exact team-private message and tentative target."""
+        return Decision(
+            action=AgentAction.WOLF_COUNCIL,
+            target_seat=self._extract_int(raw, "target_seat"),
+            team_message=self._extract_exact_text(raw, "team_message"),
+            reasoning=self._extract_str(raw, "thought") or "",
         )
 
     def _sanitize_witch(
         self,
         raw: dict,
-        obs,
         thought: str,
-        suspicion: dict[int, float],
         *,
         requested_action: str | None = None,
     ) -> Decision:
@@ -543,96 +960,60 @@ class AgentActor:
         实际编排:女巫夜间被问两次——一次决定救,一次决定毒。此处用 use_save/use_poison。
         """
         # 默认本步为 save(编排器先问救)
-        parse_failed = self._parse_lossy(raw)
         use_save = bool(raw.get("use_save", False))
         use_poison = bool(raw.get("use_poison", False))
         # 引擎通过 available_actions 告知当前问的是哪步;这里简化:若 use_poison 且有 poison_target 返回毒
         poison_seat = self._extract_int(raw, "poison_target")
-        save_seat = self._extract_int(raw, "save_target") or self._extract_int(raw, "target_seat")
+        save_seat = self._extract_int(raw, "save_target")
+        if save_seat is None:
+            save_seat = self._extract_int(raw, "target_seat")
 
         if requested_action == "save":
             if use_poison and poison_seat and not (use_save or save_seat):
                 return Decision(
-                    action=AgentAction.SKIP,
+                    action=AgentAction.POISON,
+                    target_seat=poison_seat,
                     reasoning=thought,
-                    suspicion=suspicion if suspicion else None,
-                    skip_reason="requested_action_mismatch",
-                    parse_failed=parse_failed,
                 )
             if use_save or save_seat is not None:
-                target_id = self._resolve_target(save_seat, obs, allow_self=True)
-                if target_id:
-                    return Decision(
-                        action=AgentAction.SAVE,
-                        target_id=target_id,
-                        reasoning=thought,
-                        suspicion=suspicion if suspicion else None,
-                        parse_failed=parse_failed,
-                    )
+                return Decision(
+                    action=AgentAction.SAVE,
+                    target_seat=save_seat,
+                    reasoning=thought,
+                )
             return Decision(
                 action=AgentAction.SKIP,
                 reasoning=thought,
-                suspicion=suspicion if suspicion else None,
                 skip_reason="witch_save_skipped",
-                parse_failed=parse_failed,
             )
 
         if requested_action == "poison":
-            poison_target = poison_seat or self._extract_int(raw, "target_seat")
+            poison_target = poison_seat
+            if poison_target is None:
+                poison_target = self._extract_int(raw, "target_seat")
             if use_save and save_seat is not None and not (use_poison or poison_target):
                 return Decision(
-                    action=AgentAction.SKIP,
+                    action=AgentAction.SAVE,
+                    target_seat=save_seat,
                     reasoning=thought,
-                    suspicion=suspicion if suspicion else None,
-                    skip_reason="requested_action_mismatch",
-                    parse_failed=parse_failed,
                 )
             if use_poison or poison_target is not None:
-                target_id = self._resolve_target(poison_target, obs)
-                if target_id:
-                    return Decision(
-                        action=AgentAction.POISON,
-                        target_id=target_id,
-                        reasoning=thought,
-                        suspicion=suspicion if suspicion else None,
-                        parse_failed=parse_failed,
-                    )
+                return Decision(
+                    action=AgentAction.POISON,
+                    target_seat=poison_target,
+                    reasoning=thought,
+                )
             return Decision(
                 action=AgentAction.SKIP,
                 reasoning=thought,
-                suspicion=suspicion if suspicion else None,
                 skip_reason="witch_poison_skipped",
-                parse_failed=parse_failed,
             )
 
-        # 优先毒(若指示毒且有目标)
-        if use_poison and poison_seat:
-            target_id = self._resolve_target(poison_seat, obs)
-            if target_id:
-                return Decision(
-                    action=AgentAction.POISON,
-                    target_id=target_id,
-                    reasoning=thought,
-                    suspicion=suspicion if suspicion else None,
-                    parse_failed=parse_failed,
-                )
-        if use_save and save_seat is not None:
-            target_id = self._resolve_target(save_seat, obs, allow_self=True)
-            if target_id:
-                return Decision(
-                    action=AgentAction.SAVE,
-                    target_id=target_id,
-                    reasoning=thought,
-                    suspicion=suspicion if suspicion else None,
-                    parse_failed=parse_failed,
-                )
-        return Decision(
-            action=AgentAction.SKIP,
-            reasoning=thought,
-            suspicion=suspicion if suspicion else None,
-            skip_reason="witch_no_action",
-            parse_failed=parse_failed,
+        err = AgentDecisionError(
+            f"witch adapter cannot handle ActionRequest action_kind: {requested_action!r}"
         )
+        setattr(err, "error_type", "UnsupportedActionRequest")
+        raise err
 
     @staticmethod
     def _night_action_for_request(requested_action: str | None) -> AgentAction | None:
@@ -646,64 +1027,74 @@ class AgentActor:
             "guard": AgentAction.GUARD,
         }.get(requested_action or "")
 
+    def _required_night_fields(self, requested_action: str | None) -> list[str | tuple[str, ...]]:
+        action = (requested_action or "").strip().lower()
+        if action == "save":
+            if self.role != Role.WITCH:
+                return ["target_seat?"]
+            return [("target_seat?", "save_target?")]
+        if action == "poison":
+            return [("target_seat?", "poison_target?")]
+        if action == "hunter_shot":
+            return ["target_seat?"]
+        if action in {"night_kill", "kill", "see", "guard"}:
+            return ["target_seat"]
+        return ["target_seat?"]
+
     def _sanitize_speak(self, raw: dict, obs) -> Decision:
         thought = self._extract_str(raw, "thought") or ""
-        parse_failed = self._parse_lossy(raw)
         bid = self._extract_int(raw, "bid")
         if bid is None:
-            bid = 1
-        speech = self._extract_str(raw, "speech") or ""
-        if not speech.strip():
-            speech = "(沉默)"
-        suspicion = parse_suspicion(raw.get("suspicion"), obs.alive_seats, self.seat)
-        if suspicion:
-            self.apply_suspicion(suspicion)
+            bid = 0
+        speech = self._extract_exact_text(raw, "speech") or ""
         claim = self._sanitize_claim(raw.get("claim"), obs)
-        # 结构化对话关系(方向A):reply_to 回应谁,accuses 指控谁。过滤非法座位。
+        # Public relationship metadata from this same Decision; filter invalid seats.
         reply_to = self._extract_int(raw, "reply_to")
         if reply_to is not None and (
             reply_to == obs.my_seat or not any(s["seat"] == reply_to for s in obs.seats)
         ):
             reply_to = None
         accuses = self._extract_int_list(raw, "accuses", obs)
-        # 二阶 ToM 态度网络(方向B):解析显式 attitudes,归一化到 support/oppose/neutral。
-        # validator 已在 schemas 层做 mode=before 清洗,这里只负责提取与过滤非法座位。
-        attitudes = self._extract_attitudes(raw.get("attitudes"), obs)
-        # 欺骗策略结构化(DR/PS 提升):狼人显式声明本回合欺骗手段,归一化到 4 分类/none。
-        deception = self._extract_deception(raw.get("deception"))
+        if bid <= 0:
+            return Decision(
+                action=AgentAction.SKIP,
+                reasoning=thought,
+                speech=speech or None,
+                claim=claim,
+                reply_to=reply_to,
+                accuses=accuses or None,
+                skip_reason="speech_declined",
+            )
         return Decision(
             action=AgentAction.SPEAK,
-            speech=speech,
+            speech=speech or None,
             bid=bid,
             reasoning=thought,
-            suspicion=suspicion if suspicion else None,
             claim=claim,
             reply_to=reply_to,
             accuses=accuses or None,
-            attitudes=attitudes or None,
-            deception=deception,
-            parse_failed=parse_failed,
         )
 
     @staticmethod
     def _sanitize_claim(raw: Any, obs) -> dict[str, Any] | None:
-        """校验 claim schema。仅接受规范的预言家跳身份声明,剔除乱格式自证。
+        """Validate a public role claim without comparing it to hidden truth.
 
-        合法 claim: {"role":"seer","checked_seat":<活人int>,"result":"wolf"|"village"}
-        非预言家的"我是村民"等不需要 claim(在 speech 里说即可),避免污染 claims 记录与前端。
+        Any configured role may be claimed. A seer claim may additionally carry
+        one checked seat/result pair. This deliberately permits bluffing.
         """
         if not isinstance(raw, dict):
             return None
         role = str(raw.get("role", "")).strip().lower()
-        if role != "seer":
-            # 只接受预言家跳身份 claim;其他(村民/狼人自证)一律剔除
+        if role not in {item.value for item in Role}:
             return None
-        checked_seat = raw.get("checked_seat")
-        try:
-            checked_seat = int(checked_seat)
-        except (ValueError, TypeError):
-            return None
+        if role != Role.SEER.value:
+            return {"role": role}
+        checked_seat = AgentActor._extract_int(raw, "checked_seat")
         result = str(raw.get("result", "")).strip().lower()
+        if checked_seat is None and not result:
+            return {"role": Role.SEER.value}
+        if checked_seat is None:
+            return None
         if result not in ("wolf", "village"):
             return None
         # checked_seat 必须是存在的座位(非自己);允许已死者(预言家可能验过夜里死者)
@@ -713,69 +1104,31 @@ class AgentActor:
             return None
         return {"role": "seer", "checked_seat": checked_seat, "result": result}
 
-    def _sanitize_vote(self, raw: dict, obs) -> Decision:
+    def _sanitize_vote(self, raw: dict) -> Decision:
         thought = self._extract_str(raw, "thought") or ""
-        parse_failed = self._parse_lossy(raw)
-        objective_summary = self._extract_str(raw, "objective_summary") or ""
         target_seat = self._extract_int(raw, "target_seat")
-        suspicion = parse_suspicion(raw.get("suspicion"), obs.alive_seats, self.seat)
-        if suspicion:
-            self.apply_suspicion(suspicion)
-        # PK 限制:投票目标必须在 PK 候选名单内
-        pk_seats = set(obs.vote_targets) if obs.vote_targets else set()
-        target_id = self._resolve_target(target_seat, obs)
-        if pk_seats:
-            # 若 LLM 投的不在 PK 候选内,就近修正到候选中怀疑度最高的(真实意图合理落地)
-            tgt_seat = next((s["seat"] for s in obs.seats if s["id"] == target_id), None)
-            if tgt_seat is None or tgt_seat not in pk_seats:
-                target_id = None
-                if suspicion:
-                    # 只有 LLM 给出显式怀疑度时,才按真实意图在 PK 候选中修正。
-                    cand = [s for s in pk_seats if s != self.seat]
-                    cand.sort(key=lambda s: suspicion.get(s, 0.0), reverse=True)
-                    if cand:
-                        target_id = self._resolve_target(cand[0], obs)
-        else:
-            if target_id is None:
-                # 投票必须有目标。就近选怀疑度最高的活人(真实意图的合理落地)
-                if suspicion:
-                    top = max(suspicion.items(), key=lambda kv: kv[1])
-                    target_id = self._resolve_target(top[0], obs)
-        if target_id is None:
-            return Decision(
-                action=AgentAction.SKIP,
-                reasoning=thought,
-                suspicion=suspicion if suspicion else None,
-                skip_reason="vote_target_unresolved",
-                objective_summary=objective_summary or None,
-                parse_failed=parse_failed,
-            )
+        # Preserve the exact seat intent. Protocol validation, not the Agent
+        # adapter, decides whether it belongs to the advertised target set.
         return Decision(
             action=AgentAction.VOTE,
-            target_id=target_id,
+            target_seat=target_seat,
             reasoning=thought,
-            suspicion=suspicion if suspicion else None,
-            objective_summary=objective_summary or None,
-            parse_failed=parse_failed,
         )
 
     def _sanitize_last_words(self, raw: dict) -> Decision:
         thought = self._extract_str(raw, "thought") or ""
-        speech = self._extract_str(raw, "speech") or "(无遗言)"
+        speech = self._extract_exact_text(raw, "speech") or ""
+        if not speech.strip():
+            return Decision(
+                action=AgentAction.SKIP,
+                reasoning=thought,
+                skip_reason="last_words_declined",
+            )
         return Decision(
             action=AgentAction.LAST_WORDS,
             speech=speech,
             reasoning=thought,
-            parse_failed=self._parse_lossy(raw),
         )
-
-    # ------------------------------------------------------------------
-    # 工具
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _parse_lossy(raw: dict[str, Any]) -> bool:
-        """LLM JSON 是否经过有损恢复。用于 Decision.parse_failed 透明审计。"""
-        return bool(raw.get("_parse_lossy"))
 
     def _role_extras(self) -> dict[str, str]:
         """从记忆提取角色专属状态渲染到 prompt。"""
@@ -806,18 +1159,14 @@ class AgentActor:
             extras["guard_state"] = (
                 f"上一夜守了{last_guard[-1].text}" if last_guard else "上一夜未守护"
             )
+        elif self.role == Role.DOCTOR:
+            protected = [
+                m for m in self.memory.observations if m.kind == "doctor_protect_target"
+            ]
+            extras["doctor_state"] = (
+                protected[-1].text if protected else "尚无保护记录"
+            )
         return extras
-
-    def _resolve_target(self, seat: int | None, obs, *, allow_self: bool = False) -> str | None:
-        """把座位号解析为 player_id。非法时返回 None(就近修正在上层)。"""
-        if seat is None or seat == 0:
-            return None
-        for s in obs.seats:
-            if s["seat"] == seat and s["alive"]:
-                if not allow_self and seat == obs.my_seat:
-                    return None
-                return s["id"]
-        return None
 
     @staticmethod
     def _extract_str(raw: dict, key: str) -> str | None:
@@ -828,32 +1177,54 @@ class AgentActor:
         return s or None
 
     @staticmethod
+    def _extract_exact_text(raw: dict, key: str) -> str | None:
+        """Return nonblank model text exactly as authored."""
+        val = raw.get(key)
+        if val is None:
+            return None
+        text = str(val)
+        return text if text.strip() else None
+
+    @staticmethod
     def _extract_int(raw: dict, key: str) -> int | None:
         val = raw.get(key)
         if val is None or val == "":
             return None
         try:
-            # 容忍 "3号" / 3.0 / "3"
+            # 容忍 "3号" / 3.0 / "3"，但不把 2.9 截断成 2。
             s = str(val).replace("号", "").strip()
-            return int(float(s))
+            number = float(s)
+            if not math.isfinite(number) or not number.is_integer():
+                return None
+            return int(number)
         except (ValueError, TypeError):
             return None
 
     def _extract_int_list(self, raw: dict, key: str, obs) -> list[int] | None:
-        """解析座位号列表(如 accuses),过滤自己/不存在的座位。返回去重后的列表或 None。"""
+        """解析当前指控座位，过滤自己、死亡及不存在的座位。"""
         val = raw.get(key)
         if val is None:
             return None
+        visible_seats = {
+            int(item["seat"])
+            for item in obs.seats
+            if isinstance(item, dict) and item.get("seat") is not None
+        }
+        valid_seats = visible_seats & {int(seat) for seat in obs.alive_seats}
         if not isinstance(val, (list, tuple)):
             # 容忍单个 int/"3" 形式
             single = self._extract_int(raw, key)
-            return [single] if single is not None else None
-        valid_seats = {s["seat"] for s in obs.seats}
+            if single is None or single == obs.my_seat or single not in valid_seats:
+                return None
+            return [single]
         seen: set[int] = set()
         result: list[int] = []
         for item in val:
             try:
-                seat = int(float(str(item).replace("号", "").strip()))
+                number = float(str(item).replace("号", "").strip())
+                if not math.isfinite(number) or not number.is_integer():
+                    continue
+                seat = int(number)
             except (ValueError, TypeError):
                 continue
             if seat > 0 and seat != obs.my_seat and seat in valid_seats and seat not in seen:
@@ -861,73 +1232,205 @@ class AgentActor:
                 result.append(seat)
         return result or None
 
-    def _extract_attitudes(self, raw: Any, obs) -> dict[int, str] | None:
-        """解析二阶 ToM 显式态度(方向B),归一化到 support/oppose/neutral。
-        容忍 "3号"/3.0 键 + 中文立场词,过滤自己/不存在的座位。"""
-        if not isinstance(raw, dict):
-            return None
-        normalize = {
-            "support": "support", "支持": "support", "帮腔": "support", "信任": "support", "agree": "support",
-            "oppose": "oppose", "反对": "oppose", "指控": "oppose", "怀疑": "oppose", "disagree": "oppose",
-            "neutral": "neutral", "中立": "neutral", "无": "neutral",
-        }
-        valid_seats = {s["seat"] for s in obs.seats}
-        result: dict[int, str] = {}
-        for k, val in raw.items():
-            try:
-                seat = int(float(str(k).replace("号", "").strip()))
-            except (ValueError, TypeError):
-                continue
-            if seat <= 0 or seat == obs.my_seat or seat not in valid_seats:
-                continue
-            stance = normalize.get(str(val).strip().lower()) or normalize.get(str(val).strip())
-            if stance is None:
-                rv = str(val).strip()
-                if any(ch in rv for ch in "反控疑敌"):
-                    stance = "oppose"
-                elif any(ch in rv for ch in "支帮信友同"):
-                    stance = "support"
+
+def _error_or_raw_call_trace(
+    err: BaseException,
+    raw: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    trace = getattr(err, "llm_call_trace", None)
+    if not isinstance(trace, dict) and isinstance(raw, dict):
+        trace = raw.get("_llm_call_trace")
+    return dict(trace) if isinstance(trace, dict) else None
+
+
+def _validation_retry_feedback(err: ValidationError) -> str:
+    """Build bounded field-only feedback without rejected values or context."""
+    issues = _safe_validation_issues(err)
+    rendered = "\n".join(f"- {path}: {code}" for path, code in issues)
+    return (
+        "上一响应未通过 JSON schema 校验。请重新返回完整 JSON 对象，只修正以下字段级错误；"
+        "不要复述此前的字段值、私有上下文或任何凭据。\n"
+        f"{rendered}"
+    )[:1200]
+
+
+def _validation_failure_summary(err: ValidationError) -> str:
+    issues = _safe_validation_issues(err)
+    rendered = ", ".join(f"{path}:{code}" for path, code in issues)
+    return f"LLM JSON schema validation failed ({rendered})"
+
+
+def _safe_validation_issues(err: ValidationError) -> list[tuple[str, str]]:
+    issues: list[tuple[str, str]] = []
+    rows = err.errors(include_url=False, include_context=False, include_input=False)
+    for row in rows[:_MAX_VALIDATION_FEEDBACK_ISSUES]:
+        location = row.get("loc")
+        parts: list[str] = []
+        if isinstance(location, (list, tuple)):
+            for part in location:
+                if isinstance(part, int):
+                    parts.append(str(part) if 0 <= part <= 999 else "<index>")
+                elif isinstance(part, str) and part in _VALIDATION_FEEDBACK_FIELDS:
+                    parts.append(part)
                 else:
-                    stance = "neutral"
-            result[seat] = stance
-        return result or None
-
-    def _extract_deception(self, raw: Any) -> str | None:
-        """解析欺骗策略(DR/PS 提升),归一化到 omission/distortion/fabrication/misdirection/none。
-        容忍中文/大小写。狼人填策略,好人填 none。"""
-        if raw is None:
-            return None
-        s = str(raw).strip().lower()
-        norm = {
-            "omission": "omission", "遗漏": "omission", "省略": "omission",
-            "distortion": "distortion", "扭曲": "distortion", "曲解": "distortion",
-            "fabrication": "fabrication", "捏造": "fabrication", "编造": "fabrication",
-            "misdirection": "misdirection", "误导": "misdirection", "转移": "misdirection",
-            "none": "none", "无": "none", "诚实": "none", "真话": "none",
-        }
-        return norm.get(s)
-
-    def thinking_summary(self, decision: Decision, *, verbose: bool = False) -> AgentThinking:
-        """从 Decision 生成思考摘要(推给前端,经整理)。
-
-        verbose=False(默认,保公平):摘要取前 120 字,不暴露完整隐藏推理。
-        verbose=True(上帝/复盘/研究):summary 与 reasoning 均填完整 thought,
-        暴露 agent 的分析、欺骗算计、手段——用于多 agent 对抗过程可观察。
-        """
-        reasoning = (decision.reasoning or "").strip()
-        if verbose:
-            summary = reasoning
-        else:
-            summary = reasoning[:120] + ("..." if len(reasoning) > 120 else "")
-        suspicion_top: list[dict[str, Any]] = []
-        if decision.suspicion:
-            items = sorted(decision.suspicion.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            suspicion_top = [{"seat": int(k), "suspicion": round(v, 2)} for k, v in items]
-        return AgentThinking(
-            seat=self.seat,
-            action=decision.action.value,
-            summary=summary,
-            suspicion_top=suspicion_top,
-            bid=decision.bid,
-            reasoning=reasoning if verbose else None,
+                    parts.append("<field>")
+        if err.title == "PrivateStateUpdate":
+            parts.insert(0, "private_state")
+        path = ".".join(parts) or "<root>"
+        raw_code = str(row.get("type") or "invalid")
+        code = (
+            raw_code
+            if len(raw_code) <= 64
+            and raw_code.replace("_", "").isascii()
+            and raw_code.replace("_", "").isalnum()
+            else "invalid"
         )
+        issues.append((path, code))
+    return issues or [("<root>", "invalid")]
+
+
+def _actor_response_attempt(
+    *,
+    attempt: int,
+    status: str,
+    call_trace: dict[str, Any] | None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "attempt": attempt,
+        "status": status,
+        "error_type": type(error).__name__ if error is not None else None,
+        "llm_call": dict(call_trace) if isinstance(call_trace, dict) else None,
+    }
+    if isinstance(error, ValidationError):
+        row["validation_issues"] = [
+            {"path": path, "code": code}
+            for path, code in _safe_validation_issues(error)
+        ]
+    return row
+
+
+def _tool_loop_response_attempts(result: Any, request: ActionRequest) -> list[dict[str, Any]]:
+    """Convert model generations in one Agent loop to existing call provenance."""
+    generations = [
+        row
+        for row in result.private_trace()
+        if isinstance(row, dict)
+        and row.get("type") in {"model_generation", "model_generation_failed"}
+    ]
+    attempts: list[dict[str, Any]] = []
+    for index, row in enumerate(generations, start=1):
+        if row.get("type") == "model_generation_failed":
+            trace = row.get("router_trace")
+            if not isinstance(trace, dict):
+                trace = {
+                    "call_id": row.get("call_id"),
+                    "context": {"request_id": request.request_id},
+                    "request_hash": row.get("request_hash"),
+                    "response_hash": None,
+                    "usage": {},
+                    "latency": 0.0,
+                    "finish_reason": None,
+                    "transport_attempt_count": 1,
+                    "transport_attempts": [],
+                    "parse": None,
+                }
+            attempts.append({
+                "attempt": index,
+                "status": "response_rejected",
+                "error_type": row.get("error_type") or "LLMResponseError",
+                "llm_call": dict(trace),
+            })
+            continue
+        trace = row.get("router_trace")
+        if not isinstance(trace, dict):
+            trace = {
+                "call_id": row.get("call_id"),
+                "context": {"request_id": request.request_id},
+                "request_hash": row.get("request_hash"),
+                "response_hash": row.get("response_hash"),
+                "usage": dict(row.get("usage") or {}),
+                "latency": float(row.get("latency") or 0.0),
+                "finish_reason": None,
+                "transport_attempt_count": 1,
+                "transport_attempts": [],
+                "parse": None,
+            }
+        is_last = index == len(generations)
+        if result.completed and is_last:
+            status = "accepted"
+        elif result.failed and is_last:
+            status = "session_failed"
+        else:
+            status = "tool_continued"
+        attempts.append({
+            "attempt": index,
+            "status": status,
+            "error_type": result.error.code if result.error is not None and is_last else None,
+            "llm_call": dict(trace),
+        })
+
+    cause = result.error.cause if result.error is not None else None
+    failure_trace = getattr(cause, "llm_call_trace", None)
+    if isinstance(failure_trace, dict):
+        failure_call_id = failure_trace.get("call_id")
+        if failure_call_id and all(
+            row.get("llm_call", {}).get("call_id") != failure_call_id
+            for row in attempts
+            if isinstance(row.get("llm_call"), dict)
+        ):
+            attempts.append({
+                "attempt": len(attempts) + 1,
+                "status": "provider_failed",
+                "error_type": type(cause).__name__,
+                "llm_call": dict(failure_trace),
+            })
+    return attempts
+
+
+def _human_timeout_error(request: ActionRequest, timeout: float) -> AgentDecisionError:
+    err = AgentDecisionError(
+        f"human decision timeout for request {request.request_id} after {timeout:.3f}s"
+    )
+    setattr(err, "timeout", True)
+    setattr(err, "timeout_seconds", timeout)
+    setattr(err, "error_type", "HumanDecisionTimeout")
+    setattr(err, "request_id", request.request_id)
+    return err
+
+
+def _parse_single_seat(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        seat = value
+    else:
+        text = str(value).strip()
+        if text.endswith("号"):
+            text = text[:-1].strip()
+        if not text.isdigit():
+            return None
+        try:
+            seat = int(text)
+        except (TypeError, ValueError):
+            return None
+    return seat if seat > 0 else None
+
+
+def _private_checked_seats(obs: AgentObservation, *, wolf: bool) -> set[int]:
+    """Extract only seer results actually delivered to this seat."""
+    expected = {"werewolves", "werewolf", "wolf"} if wolf else {"village", "villager", "good"}
+    seats: set[int] = set()
+    for event in obs.private_events:
+        if event.get("type") != "seer_result":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        team = str(payload.get("team") or "").strip().lower()
+        seat = _parse_single_seat(payload.get("target_seat"))
+        if seat is not None and team in expected:
+            seats.add(seat)
+    return seats

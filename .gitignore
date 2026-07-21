@@ -13,10 +13,12 @@ __pycache__/
 logs/*.log
 logs/*.jsonl
 logs/*.out
+logs/*.pid
 session_*.zip
 
 # Generated QA artifacts
 dogfood-output/
+tmp/
 
 # Frontend
 frontend/node_modules/

@@ -16,7 +16,13 @@ from .models import (
     PlayerState,
     Vote,
 )
-from .roles import Role, Team, default_role_deck
+from .roles import (
+    CLASSIC_RULESET_ID,
+    Role,
+    Team,
+    default_role_deck,
+    validate_role_deck,
+)
 
 
 class RulesError(ValueError):
@@ -46,11 +52,22 @@ class RulesEngine:
         deck: list[Role] | None = None,
         seed: int | str | None = None,
         include_hunter: bool | None = None,
+        ruleset_id: str = CLASSIC_RULESET_ID,
     ) -> GameState:
         RulesEngine._require_phase(state, Phase.SETUP)
-        deck = list(deck or default_role_deck(len(state.players), include_hunter=include_hunter))
-        if len(deck) != len(state.players):
-            raise RulesError("role deck size must match player count")
+        raw_deck = (
+            default_role_deck(len(state.players), include_hunter=include_hunter)
+            if deck is None
+            else list(deck)
+        )
+        try:
+            deck = validate_role_deck(
+                raw_deck,
+                player_count=len(state.players),
+                ruleset_id=ruleset_id,
+            )
+        except ValueError as err:
+            raise RulesError(str(err)) from err
 
         rng = random.Random(seed)
         rng.shuffle(deck)
@@ -64,7 +81,7 @@ class RulesEngine:
         state.night_actions.clear()
         state.votes.clear()
         state.winner = None
-        state.events.append(
+        RulesEngine._append_event(state,
             Event(
                 phase=Phase.SETUP,
                 day=0,
@@ -83,8 +100,13 @@ class RulesEngine:
         """
         RulesEngine._require_phase(state, Phase.NIGHT)
         actor = RulesEngine._require_living_player(state, action.actor_id)
-        target = state.get_player(action.target_id) if action.target_id else None
-        if target is not None and not target.alive:
+        if not isinstance(action.target_id, str) or not action.target_id.strip():
+            raise RulesError("night action target is required")
+        try:
+            target = state.get_player(action.target_id)
+        except KeyError as err:
+            raise RulesError("night action target must be a known player") from err
+        if not target.alive:
             raise RulesError("night action target must be alive")
         if actor.role is None:
             raise RulesError("roles have not been dealt")
@@ -107,24 +129,35 @@ class RulesEngine:
         # 狼人不能杀队友
         if action.action == NightActionType.KILL and target and target.role == Role.WEREWOLF:
             raise RulesError("werewolves cannot target a teammate at night")
+        if action.action in {NightActionType.SEE, NightActionType.POISON} and target.id == actor.id:
+            raise RulesError(f"{action.action} cannot target the acting player")
         # 女巫药水存量
         if action.action == NightActionType.SAVE and not state.witch_antidote and Role(actor.role) == Role.WITCH:
             raise RulesError("witch antidote already used")
         if action.action == NightActionType.POISON and not state.witch_poison:
             raise RulesError("witch poison already used")
+        if Role(actor.role) == Role.WITCH:
+            witch_actions = [
+                existing.action
+                for existing in state.night_actions
+                if existing.actor_id == actor.id
+                and existing.action in {NightActionType.SAVE, NightActionType.POISON}
+            ]
+            if witch_actions and action.action not in witch_actions:
+                raise RulesError("witch cannot use antidote and poison in the same night")
         # 守卫连守限制
         if action.action == NightActionType.GUARD and target:
             if state.last_guarded_seat == target.seat:
                 raise RulesError("guard cannot protect the same player two nights in a row")
 
-        # 覆盖同角色同动作的旧记录(狼人合谋:多个 kill 取多数/首个)
+        # 同一 actor 对同一动作只保留最新提交。
         state.night_actions = [
             existing
             for existing in state.night_actions
             if not (existing.actor_id == action.actor_id and existing.action == action.action)
         ]
         state.night_actions.append(action)
-        state.events.append(
+        RulesEngine._append_event(state,
             Event(
                 phase=state.phase,
                 day=state.day,
@@ -136,6 +169,48 @@ class RulesEngine:
             )
         )
         return state
+
+    @staticmethod
+    def record_wolf_council_message(
+        state: GameState,
+        *,
+        actor_id: str,
+        target_id: str,
+        message: str,
+    ) -> Event:
+        """Record one wolf's exact message for living wolf teammates only."""
+        RulesEngine._require_phase(state, Phase.NIGHT)
+        actor = RulesEngine._require_living_player(state, actor_id)
+        target = RulesEngine._require_living_player(state, target_id)
+        if actor.role != Role.WEREWOLF:
+            raise RulesError("only a living werewolf may send a council message")
+        if target.role == Role.WEREWOLF:
+            raise RulesError("werewolf council target cannot be a teammate")
+        text = str(message)
+        if not text.strip():
+            raise RulesError("werewolf council message must not be empty")
+        recipients = [
+            player.id
+            for player in sorted(state.living_players(), key=lambda item: item.seat)
+            if player.role == Role.WEREWOLF
+        ]
+        event = Event(
+            phase=Phase.NIGHT,
+            day=state.day,
+            type="wolf_council_message",
+            message=text,
+            visibility=EventVisibility.PRIVATE,
+            recipients=recipients,
+            payload={
+                "channel": "wolf_team",
+                "speaker_id": actor.id,
+                "speaker_seat": actor.seat,
+                "target_id": target.id,
+                "target_seat": target.seat,
+            },
+        )
+        RulesEngine._append_event(state, event)
+        return event
 
     @staticmethod
     def resolve_night(state: GameState) -> GameState:
@@ -161,7 +236,7 @@ class RulesEngine:
             actor = state.get_player(action.actor_id)
             target = state.get_player(action.target_id)
             result = Team.WEREWOLVES if target.role == Role.WEREWOLF else Team.VILLAGE
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.NIGHT,
                     day=state.day,
@@ -173,16 +248,23 @@ class RulesEngine:
                 )
             )
 
-        # 2) 狼人击杀目标(多狼合谋取多数,平票取首个)
+        # 2) 若调用方提交了多个狼人击杀动作，按 plurality 取目标。
+        # 当前 orchestrator 会先完成 seeded tie-break，再只提交最终目标；
+        # RulesEngine 的兜底必须仍与提交顺序无关，同票固定取最低座位。
         kill_target_id: str | None = None
         if kills:
             tally = Counter(a.target_id for a in kills)
-            kill_target_id = tally.most_common(1)[0][0]
+            highest = max(tally.values())
+            tied_targets = [target_id for target_id, count in tally.items() if count == highest]
+            kill_target_id = min(
+                tied_targets,
+                key=lambda target_id: state.get_player(target_id).seat,
+            )
         state.night_kill_target = kill_target_id
 
         # 3) 守卫守护集合
         guarded_ids = {a.target_id for a in guards}
-        # 4) 女巫解药救的人(女巫救人;医生 SAVE 视为守护类)
+        # 4) SAVE 保护集合（女巫解药与医生保护使用同一结算语义）
         saved_ids = {a.target_id for a in saves}
 
         killed: list[tuple[str, DeathReason]] = []
@@ -234,7 +316,7 @@ class RulesEngine:
         # 8) 死亡公告(不泄露角色/死因)
         if killed:
             names = [state.get_player(pid).name for pid, _ in killed]
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.NIGHT,
                     day=state.day,
@@ -244,7 +326,7 @@ class RulesEngine:
                 )
             )
         else:
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.NIGHT,
                     day=state.day,
@@ -256,22 +338,9 @@ class RulesEngine:
 
         state.night_actions.clear()
         state.night_kill_target = None
-        winner = RulesEngine.check_winner(state)
-        if winner:
-            state.phase = Phase.ENDED
-            state.winner = winner
-            RulesEngine._emit_win_event(state, winner)
-        else:
-            state.phase = Phase.DAY
-            state.votes.clear()
+        state.phase = Phase.DAY
+        state.votes.clear()
         return state
-
-    @staticmethod
-    def consume_witch_potions(state: GameState) -> None:
-        """结算后,根据本夜实际使用的行动消耗女巫药水。编排器在 resolve_night 后调用。"""
-        # 从已清空的 night_actions 无法取——改由编排器在提交时标记。
-        # 这里保留为钩子;实际消耗在 submit 时通过 action 记录,resolve 时由编排器置位。
-        pass
 
     @staticmethod
     def apply_witch_save(state: GameState, *, used: bool) -> None:
@@ -286,14 +355,24 @@ class RulesEngine:
     @staticmethod
     def queue_last_words(state: GameState, player_id: str, *, reason: str) -> None:
         """把待发表遗言入队。编排器收集后逐个让 agent 生成。"""
-        player = state.get_player(player_id)
+        try:
+            player = state.get_player(player_id)
+        except KeyError as err:
+            raise RulesError("last-words player must be known") from err
+        if any(item.get("id") == player_id for item in state.last_words_queue):
+            raise RulesError("last-words opportunity is already queued")
         state.last_words_queue.append({"id": player_id, "seat": player.seat, "name": player.name, "reason": reason})
 
     @staticmethod
     def record_last_words(state: GameState, player_id: str, text: str) -> GameState:
         """记录某玩家的遗言(公开发布)。"""
-        player = state.get_player(player_id)
-        state.events.append(
+        try:
+            player = state.get_player(player_id)
+        except KeyError as err:
+            raise RulesError("last-words player must be known") from err
+        if not isinstance(text, str) or not text.strip():
+            raise RulesError("last-words text must not be empty")
+        RulesEngine._append_event(state,
             Event(
                 phase=state.phase,
                 day=state.day,
@@ -308,20 +387,26 @@ class RulesEngine:
     @staticmethod
     def hunter_shoot(state: GameState, hunter_id: str, target_id: str | None) -> GameState:
         """猎人开枪带走一人(或放弃)。开枪后猎人技能用尽。"""
-        hunter = state.get_player(hunter_id)
+        try:
+            hunter = state.get_player(hunter_id)
+        except KeyError as err:
+            raise RulesError("hunter must be a known player") from err
         if hunter.role != Role.HUNTER:
             raise RulesError("only hunter can shoot")
         if hunter_id not in state.pending_hunter:
             raise RulesError("hunter has no pending shot (maybe poisoned)")
-        state.pending_hunter = [h for h in state.pending_hunter if h != hunter_id]
         if target_id:
-            target = state.get_player(target_id)
+            try:
+                target = state.get_player(target_id)
+            except KeyError as err:
+                raise RulesError("hunter target must be a known player") from err
             if not target.alive:
                 raise RulesError("hunter target must be alive")
+            state.pending_hunter = [h for h in state.pending_hunter if h != hunter_id]
             target.alive = False
             target.death_reason = DeathReason.HUNTER_SHOT
             target.death_day = state.day
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=state.phase,
                     day=state.day,
@@ -334,7 +419,8 @@ class RulesEngine:
             if target.role == Role.HUNTER:
                 state.pending_hunter.append(target_id)
         else:
-            state.events.append(
+            state.pending_hunter = [h for h in state.pending_hunter if h != hunter_id]
+            RulesEngine._append_event(state,
                 Event(
                     phase=state.phase,
                     day=state.day,
@@ -350,8 +436,9 @@ class RulesEngine:
         RulesEngine._require_phase(state, Phase.DAY)
         state.phase = Phase.VOTING
         state.votes.clear()
-        state.events.append(
-            Event(phase=Phase.DAY, day=state.day, type="vote_started", message="Voting has started.")
+        RulesEngine._append_event(
+            state,
+            Event(phase=Phase.DAY, day=state.day, type="vote_started", message="Voting has started."),
         )
         return state
 
@@ -360,8 +447,12 @@ class RulesEngine:
         RulesEngine._require_phase(state, Phase.VOTING)
         voter = RulesEngine._require_living_player(state, vote.voter_id)
         target = RulesEngine._require_living_player(state, vote.target_id)
+        if voter.id == target.id:
+            raise RulesError("players cannot vote for themselves")
+        if state.pk_candidates and target.id not in set(state.pk_candidates):
+            raise RulesError("PK vote target must be one of the tied candidates")
         state.votes[voter.id] = target.id
-        state.events.append(
+        RulesEngine._append_event(state,
             Event(
                 phase=Phase.VOTING,
                 day=state.day,
@@ -374,7 +465,7 @@ class RulesEngine:
         return state
 
     @staticmethod
-    def resolve_vote(state: GameState, *, allow_pk: bool = True) -> GameState:
+    def resolve_vote(state: GameState, *, allow_pk: bool = True, require_all: bool = True) -> GameState:
         """结算投票。平票时进入 PK(allow_pk=True);否则无人放逐。
 
         放逐死者:入队遗言、若为猎人则可开枪(被放逐可开枪)。
@@ -382,21 +473,55 @@ class RulesEngine:
         RulesEngine._require_phase(state, Phase.VOTING)
         living_ids = {player.id for player in state.living_players()}
         missing = living_ids - set(state.votes)
-        if missing:
+        if missing and require_all:
             raise RulesError("all living players must vote before resolving")
-
         tally = Counter(state.votes.values())
         if not tally:
-            raise RulesError("no votes to resolve")
+            if require_all:
+                raise RulesError("no votes to resolve")
+            RulesEngine._append_event(state,
+                Event(
+                    phase=Phase.VOTING,
+                    day=state.day,
+                    type="vote_tied",
+                    message="没有有效票型,无人被放逐。",
+                    payload={
+                        "tied_player_ids": [],
+                        "votes": {},
+                        "missing_player_ids": sorted(missing),
+                    },
+                )
+            )
+            state.pk_candidates = []
+            state.votes.clear()
+            return state
         top_count = tally.most_common(1)[0][1]
         tied_ids = sorted(pid for pid, count in tally.items() if count == top_count)
+
+        if missing and top_count <= len(living_ids) / 2:
+            RulesEngine._append_event(state,
+                Event(
+                    phase=Phase.VOTING,
+                    day=state.day,
+                    type="vote_tied",
+                    message="投票不完整且有效票未过半,无人被放逐。",
+                    payload={
+                        "tied_player_ids": tied_ids,
+                        "votes": dict(tally),
+                        "missing_player_ids": sorted(missing),
+                    },
+                )
+            )
+            state.pk_candidates = []
+            state.votes.clear()
+            return state
 
         if len(tied_ids) == 1:
             exiled = state.get_player(tied_ids[0])
             exiled.alive = False
             exiled.death_reason = DeathReason.EXILED
             exiled.death_day = state.day
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.VOTING,
                     day=state.day,
@@ -414,7 +539,7 @@ class RulesEngine:
         elif allow_pk and len(tied_ids) >= 2 and state.pk_candidates != tied_ids:
             # 首次平票:进入 PK
             state.pk_candidates = tied_ids
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.VOTING,
                     day=state.day,
@@ -428,7 +553,7 @@ class RulesEngine:
             return state
         else:
             # PK 后仍平票:无人放逐
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.VOTING,
                     day=state.day,
@@ -439,15 +564,7 @@ class RulesEngine:
             )
             state.pk_candidates = []
 
-        winner = RulesEngine.check_winner(state)
-        if winner:
-            state.phase = Phase.ENDED
-            state.winner = winner
-            RulesEngine._emit_win_event(state, winner)
-        else:
-            state.phase = Phase.NIGHT
-            state.day += 1
-            state.votes.clear()
+        state.votes.clear()
         return state
 
     @staticmethod
@@ -462,13 +579,22 @@ class RulesEngine:
         return None
 
     @staticmethod
+    def _append_event(state: GameState, event: Event) -> None:
+        """Append a domain event with a deterministic run-scoped identity."""
+        event.id = f"{state.id}:event:{len(state.events) + 1:06d}"
+        state.events.append(event)
+
+    @staticmethod
     def _require_phase(state: GameState, phase: Phase) -> None:
         if state.phase != phase:
             raise RulesError(f"expected phase {phase}, got {state.phase}")
 
     @staticmethod
     def _require_living_player(state: GameState, player_id: str) -> PlayerState:
-        player = state.get_player(player_id)
+        try:
+            player = state.get_player(player_id)
+        except KeyError as err:
+            raise RulesError("player must be known") from err
         if not player.alive:
             raise RulesError("player must be alive")
         return player
@@ -481,7 +607,7 @@ class RulesEngine:
             payload = {"role": player.role, "team": player.team}
             if player.role == Role.WEREWOLF:
                 payload["teammates"] = wolf_payload
-            state.events.append(
+            RulesEngine._append_event(state,
                 Event(
                     phase=Phase.SETUP,
                     day=0,
@@ -495,7 +621,7 @@ class RulesEngine:
 
     @staticmethod
     def _emit_win_event(state: GameState, winner: Team) -> None:
-        state.events.append(
+        RulesEngine._append_event(state,
             Event(
                 phase=state.phase,
                 day=state.day,
