@@ -444,7 +444,7 @@ class GameOrchestratorV2:
                 request_deadline = decision_deadline
                 deadline_source = "decision"
         effective_timeout = (
-            max(0.0, request_deadline - deadline_started)
+            round(max(0.0, request_deadline - deadline_started), 6)
             if request_deadline is not None
             else None
         )
